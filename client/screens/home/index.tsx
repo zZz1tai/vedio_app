@@ -269,6 +269,7 @@ export default function HomeScreen() {
         </View>
       ) : (
         <FlatList
+          key={viewMode}
           data={videos}
           keyExtractor={(item) => item.id}
           renderItem={renderVideoCard}

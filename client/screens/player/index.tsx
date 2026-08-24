@@ -108,10 +108,10 @@ export default function PlayerScreen() {
     async (seconds: number) => {
       if (videoRef.current) {
         const status = await videoRef.current.getStatusAsync();
-        if ('position' in status) {
+        if ('positionMillis' in status) {
           const newPosition = Math.max(
             0,
-            Math.min((status.position as number) + seconds * 1000, duration)
+            Math.min(status.positionMillis + seconds * 1000, duration)
           );
           await videoRef.current.setPositionAsync(newPosition);
           setCurrentTime(newPosition);
@@ -154,20 +154,29 @@ export default function PlayerScreen() {
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
   // Custom slider using PanResponder
+  // 用 ref 持有最新的 handleSeek，避免 PanResponder 只创建一次导致闭包过期
+  const seekRef = useRef(handleSeek);
+  useEffect(() => {
+    seekRef.current = handleSeek;
+  }, [handleSeek]);
+  const dragStartX = useRef(0);
+
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: (_evt, gestureState) => {
+      onPanResponderGrant: (evt) => {
+        // locationX 是相对进度条的局部坐标（x0/moveX 是屏幕绝对坐标，不能直接用）
+        const localX = evt.nativeEvent.locationX;
+        dragStartX.current = typeof localX === 'number' && !Number.isNaN(localX) ? localX : 0;
         if (progressBarWidth.current > 0) {
-          const percent = (gestureState.x0 / progressBarWidth.current) * 100;
-          handleSeek(percent);
+          seekRef.current((dragStartX.current / progressBarWidth.current) * 100);
         }
       },
       onPanResponderMove: (_evt, gestureState) => {
         if (progressBarWidth.current > 0) {
-          const percent = (gestureState.moveX / progressBarWidth.current) * 100;
-          handleSeek(percent);
+          const x = dragStartX.current + (gestureState.moveX - gestureState.x0);
+          seekRef.current((x / progressBarWidth.current) * 100);
         }
       },
     })

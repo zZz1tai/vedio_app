@@ -1,6 +1,6 @@
 import { ExpoConfig, ConfigContext } from 'expo/config';
 
-const appName = process.env.COZE_PROJECT_NAME || process.env.EXPO_PUBLIC_COZE_PROJECT_NAME || '应用';
+const appName = process.env.COZE_PROJECT_NAME || process.env.EXPO_PUBLIC_COZE_PROJECT_NAME || '夜映';
 const projectId = process.env.COZE_PROJECT_ID || process.env.EXPO_PUBLIC_COZE_PROJECT_ID;
 const slugAppName = projectId ? `app${projectId}` : 'myapp';
 
@@ -49,29 +49,29 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       [
         "expo-image-picker",
         {
-          "photosPermission": `允许全能视频App访问您的相册，以便您上传或保存图片。`,
-          "cameraPermission": `允许全能视频App使用您的相机，以便您直接拍摄照片上传。`,
-          "microphonePermission": `允许全能视频App访问您的麦克风，以便您拍摄带有声音的视频。`
+          "photosPermission": `允许夜映访问您的相册，以便您上传或保存图片。`,
+          "cameraPermission": `允许夜映使用您的相机，以便您直接拍摄照片上传。`,
+          "microphonePermission": `允许夜映访问您的麦克风，以便您拍摄带有声音的视频。`
         }
       ],
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": `全能视频App需要访问您的位置以提供周边服务及导航功能。`
+          "locationWhenInUsePermission": `夜映需要访问您的位置以提供周边服务及导航功能。`
         }
       ],
       [
         "expo-camera",
         {
-          "cameraPermission": `全能视频App需要访问相机以拍摄照片和视频。`,
-          "microphonePermission": `全能视频App需要访问麦克风以录制视频声音。`,
+          "cameraPermission": `夜映需要访问相机以拍摄照片和视频。`,
+          "microphonePermission": `夜映需要访问麦克风以录制视频声音。`,
           "recordAudioAndroid": true
         }
       ],
       [
         "expo-media-library",
         {
-          "photosPermission": `允许全能视频App访问您的媒体文件，以便浏览和播放视频。`,
+          "photosPermission": `允许夜映访问您的媒体文件，以便浏览和播放视频。`,
           "isAccessMediaLocationEnabled": true
         }
       ]
