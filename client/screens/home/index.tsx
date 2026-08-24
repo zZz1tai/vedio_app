@@ -6,6 +6,7 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   Dimensions,
+  Linking,
   Platform,
   StyleSheet,
 } from 'react-native';
@@ -37,17 +38,32 @@ export default function HomeScreen() {
   const [videos, setVideos] = useState<VideoItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [permissionGranted, setPermissionGranted] = useState(false);
+  const [permissionCanAskAgain, setPermissionCanAskAgain] = useState(true);
+  const [hasInitialized, setHasInitialized] = useState(false);
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
 
   const requestPermission = useCallback(async () => {
     try {
-      const { status } = await MediaLibrary.requestPermissionsAsync();
-      if (status === 'granted') {
-        setPermissionGranted(true);
-        return true;
-      }
-      return false;
+      const permission = await MediaLibrary.requestPermissionsAsync();
+      const granted = permission.status === 'granted';
+      setPermissionGranted(granted);
+      setPermissionCanAskAgain(permission.canAskAgain);
+      return granted;
     } catch {
+      setPermissionGranted(false);
+      return false;
+    }
+  }, []);
+
+  const refreshPermission = useCallback(async () => {
+    try {
+      const permission = await MediaLibrary.getPermissionsAsync();
+      const granted = permission.status === 'granted';
+      setPermissionGranted(granted);
+      setPermissionCanAskAgain(permission.canAskAgain);
+      return granted;
+    } catch {
+      setPermissionGranted(false);
       return false;
     }
   }, []);
@@ -89,16 +105,28 @@ export default function HomeScreen() {
       } else {
         setLoading(false);
       }
+      setHasInitialized(true);
     };
     init();
   }, [requestPermission, loadVideos]);
 
   useFocusEffect(
     useCallback(() => {
-      if (permissionGranted) {
-        loadVideos();
-      }
-    }, [permissionGranted, loadVideos])
+      if (!hasInitialized) return;
+
+      let isActive = true;
+      const refreshVideos = async () => {
+        const granted = await refreshPermission();
+        if (isActive && granted) {
+          await loadVideos();
+        }
+      };
+      refreshVideos();
+
+      return () => {
+        isActive = false;
+      };
+    }, [hasInitialized, loadVideos, refreshPermission])
   );
 
   const handlePlayVideo = useCallback(
@@ -113,11 +141,16 @@ export default function HomeScreen() {
   );
 
   const handleRetryPermission = useCallback(async () => {
+    if (!permissionCanAskAgain) {
+      await Linking.openSettings();
+      return;
+    }
+
     const granted = await requestPermission();
     if (granted) {
       await loadVideos();
     }
-  }, [requestPermission, loadVideos]);
+  }, [loadVideos, permissionCanAskAgain, requestPermission]);
 
   const renderVideoCard = useCallback(
     ({ item }: { item: VideoItem }) => {
@@ -231,7 +264,9 @@ export default function HomeScreen() {
             请授予媒体库访问权限，以便扫描和播放您设备上的视频文件
           </Text>
           <TouchableOpacity style={styles.permissionButton} onPress={handleRetryPermission}>
-            <Text style={styles.permissionButtonText}>授予权限</Text>
+            <Text style={styles.permissionButtonText}>
+              {permissionCanAskAgain ? '授予权限' : '打开系统设置'}
+            </Text>
           </TouchableOpacity>
         </View>
       </Screen>

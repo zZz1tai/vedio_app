@@ -11,14 +11,18 @@ import {
 import { Video, ResizeMode } from 'expo-av';
 import type { default as VideoType } from 'expo-av/build/Video';
 import { FontAwesome6 } from '@expo/vector-icons';
+import * as NavigationBar from 'expo-navigation-bar';
+import { setStatusBarHidden } from 'expo-status-bar';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { formatDuration } from '@/utils/format';
 
 export default function PlayerScreen() {
   const router = useSafeRouter();
+  const insets = useSafeAreaInsets();
   const { uri, title, duration: durationParam } = useSafeSearchParams<{
-    uri: string;
+    uri?: string;
     title: string;
     duration: number;
   }>();
@@ -27,56 +31,89 @@ export default function PlayerScreen() {
   const [isPlaying, setIsPlaying] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(durationParam ? durationParam * 1000 : 0);
-  const [isFullscreen] = useState(true);
   const [showControls, setShowControls] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
   const hideControlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const progressBarWidth = useRef(0);
+  const isPlayingRef = useRef(isPlaying);
+  const [progressBarWidth, setProgressBarWidth] = useState(0);
+  const isAndroid = Platform.OS === 'android';
 
   const playbackRates = useMemo(() => [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], []);
 
-  const startHideTimer = useCallback(() => {
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  const clearHideTimer = useCallback(() => {
     if (hideControlsTimer.current) {
       clearTimeout(hideControlsTimer.current);
+      hideControlsTimer.current = null;
     }
+  }, []);
+
+  const startHideTimer = useCallback(() => {
+    clearHideTimer();
+    if (!isPlayingRef.current) return;
+
     hideControlsTimer.current = setTimeout(() => {
-      setShowControls((prev) => {
-        // Only hide if playing
-        if (isPlaying) return false;
-        return prev;
-      });
+      if (isPlayingRef.current) {
+        setShowControls(false);
+      }
     }, 3000);
-  }, [isPlaying]);
+  }, [clearHideTimer]);
 
   const handleTap = useCallback(() => {
     setShowControls((prev) => {
       const next = !prev;
       if (next) {
-        // If showing controls, start the hide timer
-        if (hideControlsTimer.current) {
-          clearTimeout(hideControlsTimer.current);
-        }
-        hideControlsTimer.current = setTimeout(() => {
-          setShowControls((p) => {
-            if (isPlaying) return false;
-            return p;
-          });
-        }, 3000);
+        startHideTimer();
       }
       return next;
     });
-  }, [isPlaying]);
+  }, [startHideTimer]);
 
   useEffect(() => {
-    // Initial show with timer
-    startHideTimer();
+    if (isPlaying) {
+      startHideTimer();
+    } else {
+      clearHideTimer();
+      setShowControls(true);
+    }
+  }, [clearHideTimer, isPlaying, startHideTimer]);
+
+  useEffect(() => clearHideTimer, [clearHideTimer]);
+
+  useEffect(() => {
+    setStatusBarHidden(true, 'none');
+
+    if (Platform.OS === 'android') {
+      const enterImmersiveMode = async () => {
+        try {
+          await NavigationBar.setBehaviorAsync('overlay-swipe');
+        } catch (error) {
+          console.warn('Unable to configure immersive navigation:', error);
+        }
+
+        try {
+          await NavigationBar.setVisibilityAsync('hidden');
+        } catch (error) {
+          console.warn('Unable to hide Android navigation bar:', error);
+        }
+      };
+
+      void enterImmersiveMode();
+    }
+
     return () => {
-      if (hideControlsTimer.current) {
-        clearTimeout(hideControlsTimer.current);
+      setStatusBarHidden(false, 'none');
+      if (Platform.OS === 'android') {
+        void NavigationBar.setVisibilityAsync('visible').catch((error) => {
+          console.warn('Unable to restore Android navigation bar:', error);
+        });
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handlePlayPause = useCallback(async () => {
@@ -86,14 +123,13 @@ export default function PlayerScreen() {
       } else {
         await videoRef.current.playAsync();
       }
-      setIsPlaying(!isPlaying);
-      startHideTimer();
+      setIsPlaying((previous) => !previous);
     }
   }, [isPlaying, startHideTimer]);
 
   const handleSeek = useCallback(
     async (value: number) => {
-      if (videoRef.current && duration > 0 && progressBarWidth.current > 0) {
+      if (videoRef.current && duration > 0 && progressBarWidth > 0) {
         const clampedValue = Math.max(0, Math.min(100, value));
         const seekPosition = (clampedValue / 100) * duration;
         await videoRef.current.setPositionAsync(seekPosition);
@@ -101,7 +137,7 @@ export default function PlayerScreen() {
         startHideTimer();
       }
     },
-    [duration, startHideTimer]
+    [duration, progressBarWidth, startHideTimer]
   );
 
   const handleSkip = useCallback(
@@ -143,7 +179,11 @@ export default function PlayerScreen() {
 
   const handleToggleFullscreen = useCallback(async () => {
     if (videoRef.current) {
-      await videoRef.current.presentFullscreenPlayer();
+      try {
+        await videoRef.current.presentFullscreenPlayer();
+      } catch (error) {
+        console.warn('Fullscreen video is not available on this platform:', error);
+      }
     }
   }, []);
 
@@ -153,44 +193,61 @@ export default function PlayerScreen() {
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
-  // Custom slider using PanResponder
-  // 用 ref 持有最新的 handleSeek，避免 PanResponder 只创建一次导致闭包过期
-  const seekRef = useRef(handleSeek);
-  useEffect(() => {
-    seekRef.current = handleSeek;
-  }, [handleSeek]);
-  const dragStartX = useRef(0);
-
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: (evt) => {
-        // locationX 是相对进度条的局部坐标（x0/moveX 是屏幕绝对坐标，不能直接用）
-        const localX = evt.nativeEvent.locationX;
-        dragStartX.current = typeof localX === 'number' && !Number.isNaN(localX) ? localX : 0;
-        if (progressBarWidth.current > 0) {
-          seekRef.current((dragStartX.current / progressBarWidth.current) * 100);
-        }
-      },
-      onPanResponderMove: (_evt, gestureState) => {
-        if (progressBarWidth.current > 0) {
-          const x = dragStartX.current + (gestureState.moveX - gestureState.x0);
-          seekRef.current((x / progressBarWidth.current) * 100);
-        }
-      },
-    })
-  ).current;
+  // Custom slider using PanResponder.
+  const panResponder = useMemo(
+    () => {
+      // The responder reads the video ref only when a touch event fires.
+      // eslint-disable-next-line react-hooks/refs
+      return PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: (evt) => {
+          // locationX 是相对进度条的局部坐标（x0/moveX 是屏幕绝对坐标，不能直接用）
+          const localX = evt.nativeEvent.locationX;
+          if (progressBarWidth > 0) {
+            handleSeek((localX / progressBarWidth) * 100);
+          }
+        },
+        onPanResponderMove: (evt) => {
+          if (progressBarWidth > 0) {
+            handleSeek((evt.nativeEvent.locationX / progressBarWidth) * 100);
+          }
+        },
+      });
+    },
+    [handleSeek, progressBarWidth]
+  );
 
   const onProgressBarLayout = useCallback((e: LayoutChangeEvent) => {
-    progressBarWidth.current = e.nativeEvent.layout.width;
+    setProgressBarWidth(e.nativeEvent.layout.width);
   }, []);
+
+  const hasVideoUri = typeof uri === 'string' && uri.trim().length > 0;
+
+  if (!hasVideoUri) {
+    return (
+      <Screen
+        backgroundColor="#000000"
+        statusBarStyle="light"
+        safeAreaEdges={['top', 'left', 'right', 'bottom']}
+      >
+        <View style={styles.errorContainer}>
+          <FontAwesome6 name="circle-exclamation" size={40} color="#FCA5A5" />
+          <Text style={styles.errorTitle}>无法打开视频</Text>
+          <Text style={styles.errorMessage}>视频地址无效或已失效。</Text>
+          <TouchableOpacity style={styles.errorBackButton} onPress={handleGoBack}>
+            <Text style={styles.errorBackButtonText}>返回列表</Text>
+          </TouchableOpacity>
+        </View>
+      </Screen>
+    );
+  }
 
   return (
     <Screen
       backgroundColor="#000000"
       statusBarStyle="light"
-      safeAreaEdges={isFullscreen ? [] : ['left', 'right']}
+      safeAreaEdges={[]}
     >
       <TouchableOpacity
         style={styles.videoContainer}
@@ -199,12 +256,16 @@ export default function PlayerScreen() {
       >
         <Video
           ref={videoRef}
-          source={{ uri: uri as string }}
+          source={{ uri }}
           style={styles.video}
-          resizeMode={ResizeMode.CONTAIN}
-          shouldPlay
+          resizeMode={ResizeMode.COVER}
+          shouldPlay={isPlaying}
           isLooping={false}
-          onError={(e) => console.error('Video error:', e)}
+          onError={(event) => {
+            console.error('Video error:', event);
+            setIsPlaying(false);
+            setPlaybackError('此视频无法播放，可能是文件已删除或格式不受支持。');
+          }}
           onPlaybackStatusUpdate={(status) => {
             if ('isPlaying' in status) {
               setIsPlaying(status.isPlaying);
@@ -218,23 +279,42 @@ export default function PlayerScreen() {
           }}
         />
 
+        {playbackError && (
+          <View style={styles.playbackErrorOverlay} pointerEvents="none">
+            <Text style={styles.playbackErrorText}>{playbackError}</Text>
+          </View>
+        )}
+
         {/* Top overlay */}
         {showControls && (
-          <View style={styles.topOverlay}>
+          <View
+            style={[
+              styles.topOverlay,
+              {
+                paddingTop: isAndroid
+                  ? 16
+                  : Math.max(insets.top + 12, Platform.OS === 'web' ? 20 : 48),
+                paddingLeft: isAndroid ? 16 : Math.max(insets.left + 12, 16),
+                paddingRight: isAndroid ? 16 : Math.max(insets.right + 12, 16),
+              },
+            ]}
+          >
             <TouchableOpacity style={styles.backButton} onPress={handleGoBack}>
               <FontAwesome6 name="chevron-left" size={20} color="#FFFFFF" />
             </TouchableOpacity>
             <Text style={styles.videoTitle} numberOfLines={1}>
               {title || 'Video'}
             </Text>
-            <View style={styles.topRight}>
-              <TouchableOpacity
-                style={styles.controlButton}
-                onPress={handleToggleFullscreen}
-              >
-                <FontAwesome6 name="expand" size={16} color="#FFFFFF" />
-              </TouchableOpacity>
-            </View>
+            {!isAndroid && (
+              <View style={styles.topRight}>
+                <TouchableOpacity
+                  style={styles.controlButton}
+                  onPress={handleToggleFullscreen}
+                >
+                  <FontAwesome6 name="expand" size={16} color="#FFFFFF" />
+                </TouchableOpacity>
+              </View>
+            )}
           </View>
         )}
 
@@ -249,7 +329,18 @@ export default function PlayerScreen() {
 
         {/* Bottom controls */}
         {showControls && (
-          <View style={styles.bottomOverlay}>
+          <View
+            style={[
+              styles.bottomOverlay,
+              {
+                paddingBottom: isAndroid
+                  ? 16
+                  : Math.max(insets.bottom + 12, Platform.OS === 'web' ? 16 : 24),
+                paddingLeft: isAndroid ? 16 : Math.max(insets.left + 12, 16),
+                paddingRight: isAndroid ? 16 : Math.max(insets.right + 12, 16),
+              },
+            ]}
+          >
             {/* Progress bar */}
             <View style={styles.progressContainer}>
               <Text style={styles.timeText}>{formatDuration(currentTime)}</Text>
@@ -467,5 +558,50 @@ const styles = StyleSheet.create({
     color: '#F1F5F9',
     fontSize: 12,
     fontWeight: '700',
+  },
+  errorContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+  },
+  errorTitle: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '700',
+    marginTop: 16,
+  },
+  errorMessage: {
+    color: '#94A3B8',
+    fontSize: 14,
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  errorBackButton: {
+    backgroundColor: '#4F46E5',
+    borderRadius: 8,
+    marginTop: 24,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+  },
+  errorBackButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  playbackErrorOverlay: {
+    alignItems: 'center',
+    bottom: 0,
+    justifyContent: 'center',
+    left: 0,
+    padding: 24,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  playbackErrorText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    textAlign: 'center',
   },
 });
