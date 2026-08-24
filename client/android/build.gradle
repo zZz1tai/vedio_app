@@ -20,11 +20,10 @@ allprojects {
   }
 }
 
-// Keep native-module intermediates under the Android project. On Windows this
-// avoids CMake command paths exceeding MAX_PATH inside pnpm's virtual store.
-subprojects { project ->
-  project.buildDir = new File(rootProject.buildDir, project.path.replace(':', '_'))
-}
+// NOTE: the old buildDir redirection hook was removed on purpose.
+// With pnpm node-linker=hoisted the dependency paths are already short enough,
+// and RN autolinking's generated CMake expects codegen output under
+// <module>/android/build — redirecting buildDir breaks :app cmake configure.
 
 apply plugin: "expo-root-project"
 apply plugin: "com.facebook.react.rootproject"

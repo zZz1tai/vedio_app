@@ -23,7 +23,7 @@ export default function RootLayout() {
         }}
       >
         <Stack.Screen name="index" options={{ title: "" }} />
-        <Stack.Screen name="player" options={{ title: "", orientation: 'landscape', gestureEnabled: false }} />
+        <Stack.Screen name="player" options={{ title: "", gestureEnabled: false }} />
       </Stack>
       <Toast />
     </Provider>

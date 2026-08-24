@@ -12,11 +12,43 @@ import { Video, ResizeMode } from 'expo-av';
 import type { default as VideoType } from 'expo-av/build/Video';
 import { FontAwesome6 } from '@expo/vector-icons';
 import * as NavigationBar from 'expo-navigation-bar';
+import * as Brightness from 'expo-brightness';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import { setStatusBarHidden } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
-import { formatDuration } from '@/utils/format';
+import { formatDuration, getQualityLabel } from '@/utils/format';
+
+const SCALE_MODE_OPTIONS = [
+  { mode: ResizeMode.CONTAIN, label: '默认' },
+  { mode: ResizeMode.COVER, label: '填充' },
+  { mode: ResizeMode.STRETCH, label: '拉伸' },
+] as const;
+
+const MIN_VIDEO_SCALE = 0.5;
+const MAX_VIDEO_SCALE = 3;
+const DOUBLE_TAP_INTERVAL_MS = 280;
+const TAP_SLOP_PX = 8;
+const LONG_PRESS_DURATION_MS = 450;
+const LONG_PRESS_RATE_OPTIONS = [1.5, 2.0, 3.0];
+const BRIGHTNESS_SENSITIVITY = 1.4;
+const VOLUME_SENSITIVITY = 1;
+
+const touchDistance = (
+  a: { pageX: number; pageY: number },
+  b: { pageX: number; pageY: number }
+) => Math.hypot(a.pageX - b.pageX, a.pageY - b.pageY);
+
+const centroidOf = (touches: ReadonlyArray<{ pageX: number; pageY: number }>) => {
+  let x = 0;
+  let y = 0;
+  touches.forEach((touch) => {
+    x += touch.pageX;
+    y += touch.pageY;
+  });
+  return { x: x / touches.length, y: y / touches.length };
+};
 
 export default function PlayerScreen() {
   const router = useSafeRouter();
@@ -37,14 +69,84 @@ export default function PlayerScreen() {
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const hideControlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isPlayingRef = useRef(isPlaying);
+  const isMutedRef = useRef(isMuted);
   const [progressBarWidth, setProgressBarWidth] = useState(0);
   const isAndroid = Platform.OS === 'android';
+
+  const [scaleModeIndex, setScaleModeIndex] = useState(0);
+  const scaleMode = SCALE_MODE_OPTIONS[scaleModeIndex].mode;
+  const [videoScale, setVideoScale] = useState(1);
+  const [videoOffset, setVideoOffset] = useState({ x: 0, y: 0 });
+  const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+  const videoTransformRef = useRef({ scale: 1, offset: { x: 0, y: 0 } });
+  const containerSizeRef = useRef(containerSize);
+  const gestureRef = useRef({
+    activeTouches: 0,
+    moved: false,
+    longPressActive: false,
+    adjustSide: 'none' as 'none' | 'brightness' | 'volume',
+    startBrightness: 1,
+    startVolume: 1,
+    startDistance: 0,
+    startScale: 1,
+    startCentroid: { x: 0, y: 0 },
+    startOffset: { x: 0, y: 0 },
+    startPage: { x: 0, y: 0 },
+  });
+  const lastTapAtRef = useRef(0);
+  const tapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [adjustIndicator, setAdjustIndicator] = useState<{
+    side: 'brightness' | 'volume';
+    value: number;
+  } | null>(null);
+  const adjustHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const brightnessRef = useRef(1);
+  const volumeRef = useRef(1);
+
+  const [videoDimensions, setVideoDimensions] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
+  const naturalSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const [orientationMode, setOrientationMode] = useState<'auto' | 'portrait' | 'landscape'>(
+    'auto'
+  );
+  const manualOrientationRef = useRef(false);
 
   const playbackRates = useMemo(() => [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], []);
 
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+  }, [isMuted]);
+
+  useEffect(() => {
+    videoTransformRef.current = { scale: videoScale, offset: videoOffset };
+  }, [videoOffset, videoScale]);
+
+  useEffect(() => {
+    containerSizeRef.current = containerSize;
+  }, [containerSize]);
+
+  const clampVideoOffset = useCallback(
+    (offset: { x: number; y: number }, scale: number) => {
+      const maxX = Math.max(0, ((scale - 1) * containerSizeRef.current.width) / 2);
+      const maxY = Math.max(0, ((scale - 1) * containerSizeRef.current.height) / 2);
+      return {
+        x: Math.max(-maxX, Math.min(maxX, offset.x)),
+        y: Math.max(-maxY, Math.min(maxY, offset.y)),
+      };
+    },
+    []
+  );
+
+  const resetVideoTransform = useCallback(() => {
+    setVideoScale(1);
+    setVideoOffset({ x: 0, y: 0 });
+  }, []);
 
   const clearHideTimer = useCallback(() => {
     if (hideControlsTimer.current) {
@@ -64,7 +166,163 @@ export default function PlayerScreen() {
     }, 3000);
   }, [clearHideTimer]);
 
-  const handleTap = useCallback(() => {
+  const [longPressRate, setLongPressRate] = useState(2.0);
+  const [isBoosting, setIsBoosting] = useState(false);
+  const [showSpeedMenu, setShowSpeedMenu] = useState(false);
+  const playbackRateRef = useRef(playbackRate);
+  const longPressRateRef = useRef(longPressRate);
+  const savedRateRef = useRef(1.0);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    playbackRateRef.current = playbackRate;
+  }, [playbackRate]);
+
+  useEffect(() => {
+    longPressRateRef.current = longPressRate;
+  }, [longPressRate]);
+
+  useEffect(() => {
+    if (!showControls && showSpeedMenu) {
+      setShowSpeedMenu(false);
+    }
+  }, [showControls, showSpeedMenu]);
+
+  const applyRate = useCallback(async (rate: number) => {
+    if (!videoRef.current) return;
+    try {
+      await videoRef.current.setRateAsync(rate, true);
+    } catch (error) {
+      console.warn('Unable to change playback rate:', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    Brightness.getBrightnessAsync()
+      .then((value) => {
+        if (typeof value === 'number') {
+          brightnessRef.current = Math.min(1, Math.max(0.05, value));
+        }
+      })
+      .catch((error) => {
+        console.warn('Unable to read screen brightness:', error);
+      });
+    return () => {
+      if (adjustHideTimerRef.current) {
+        clearTimeout(adjustHideTimerRef.current);
+      }
+    };
+  }, []);
+
+  const showAdjustIndicator = useCallback(
+    (side: 'brightness' | 'volume', value: number) => {
+      setAdjustIndicator({ side, value });
+      if (adjustHideTimerRef.current) {
+        clearTimeout(adjustHideTimerRef.current);
+      }
+      adjustHideTimerRef.current = setTimeout(() => {
+        adjustHideTimerRef.current = null;
+        setAdjustIndicator(null);
+      }, 800);
+    },
+    []
+  );
+
+  const applyBrightness = useCallback(
+    (value: number) => {
+      const clamped = Math.min(1, Math.max(0.05, value));
+      brightnessRef.current = clamped;
+      showAdjustIndicator('brightness', clamped);
+      Brightness.setBrightnessAsync(clamped).catch((error) => {
+        console.warn('Unable to set screen brightness:', error);
+      });
+    },
+    [showAdjustIndicator]
+  );
+
+  const applyVolume = useCallback(
+    (value: number) => {
+      const clamped = Math.min(1, Math.max(0, value));
+      volumeRef.current = clamped;
+      showAdjustIndicator('volume', clamped);
+      void videoRef.current?.setVolumeAsync(clamped);
+      if (clamped === 0 && !isMutedRef.current) {
+        setIsMuted(true);
+      } else if (clamped > 0 && isMutedRef.current) {
+        setIsMuted(false);
+      }
+    },
+    [showAdjustIndicator]
+  );
+
+  const handleSelectRate = useCallback(
+    (rate: number) => {
+      setPlaybackRate(rate);
+      void applyRate(rate);
+      setShowSpeedMenu(false);
+      startHideTimer();
+    },
+    [applyRate, startHideTimer]
+  );
+
+  const handleSelectLongPressRate = useCallback((rate: number) => {
+    setLongPressRate(rate);
+    setShowSpeedMenu(false);
+  }, []);
+
+  useEffect(() => {
+    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.DEFAULT).catch(
+      (error) => {
+        console.warn('Unable to reset orientation:', error);
+      }
+    );
+  }, []);
+
+  const applyOrientationForVideo = useCallback((width: number, height: number) => {
+    if (!width || !height) {
+      ScreenOrientation.unlockAsync().catch(() => undefined);
+      return;
+    }
+    if (height >= width) {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(
+        () => undefined
+      );
+    } else {
+      ScreenOrientation.unlockAsync().catch(() => undefined);
+    }
+  }, []);
+
+  useEffect(() => {
+    manualOrientationRef.current = false;
+    setOrientationMode('auto');
+  }, [uri]);
+
+  const handleToggleOrientation = useCallback(async () => {
+    manualOrientationRef.current = true;
+    const nextMode: 'portrait' | 'landscape' =
+      orientationMode === 'landscape' ? 'portrait' : 'landscape';
+    setOrientationMode(nextMode);
+    try {
+      if (nextMode === 'landscape') {
+        await ScreenOrientation.lockAsync(
+          ScreenOrientation.OrientationLock.LANDSCAPE
+        );
+      } else {
+        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+      }
+    } catch (error) {
+      console.warn('Unable to change orientation lock:', error);
+    }
+    startHideTimer();
+  }, [orientationMode, startHideTimer]);
+
+  const handleCycleScaleMode = useCallback(() => {
+    setScaleModeIndex((prev) => (prev + 1) % SCALE_MODE_OPTIONS.length);
+    resetVideoTransform();
+    startHideTimer();
+  }, [resetVideoTransform, startHideTimer]);
+
+  const toggleControls = useCallback(() => {
     setShowControls((prev) => {
       const next = !prev;
       if (next) {
@@ -73,6 +331,183 @@ export default function PlayerScreen() {
       return next;
     });
   }, [startHideTimer]);
+
+  const handleVideoPress = useCallback(() => {
+    const now = Date.now();
+    if (now - lastTapAtRef.current <= DOUBLE_TAP_INTERVAL_MS) {
+      lastTapAtRef.current = 0;
+      if (tapTimerRef.current) {
+        clearTimeout(tapTimerRef.current);
+        tapTimerRef.current = null;
+      }
+      resetVideoTransform();
+      return;
+    }
+    lastTapAtRef.current = now;
+    tapTimerRef.current = setTimeout(() => {
+      tapTimerRef.current = null;
+      toggleControls();
+    }, DOUBLE_TAP_INTERVAL_MS);
+  }, [resetVideoTransform, toggleControls]);
+
+  useEffect(
+    () => () => {
+      if (tapTimerRef.current) {
+        clearTimeout(tapTimerRef.current);
+      }
+      if (longPressTimerRef.current) {
+        clearTimeout(longPressTimerRef.current);
+      }
+    },
+    []
+  );
+
+  const cancelLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
+  const stopBoost = useCallback(() => {
+    const gesture = gestureRef.current;
+    if (!gesture.longPressActive) return;
+    gesture.longPressActive = false;
+    setIsBoosting(false);
+    void applyRate(savedRateRef.current);
+  }, [applyRate]);
+
+  const videoGestureResponder = useMemo(() => {
+    // eslint-disable-next-line react-hooks/refs
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: (evt) => {
+        const { touches } = evt.nativeEvent;
+        const gesture = gestureRef.current;
+        gesture.activeTouches = touches.length;
+        gesture.moved = false;
+        gesture.longPressActive = false;
+        gesture.startOffset = videoTransformRef.current.offset;
+        if (touches.length >= 2) {
+          gesture.startDistance = touchDistance(touches[0], touches[1]);
+          gesture.startScale = videoTransformRef.current.scale;
+          gesture.startCentroid = centroidOf(touches);
+        } else {
+          gesture.startDistance = 0;
+          gesture.startPage = { x: evt.nativeEvent.pageX, y: evt.nativeEvent.pageY };
+          longPressTimerRef.current = setTimeout(() => {
+            longPressTimerRef.current = null;
+            if (gesture.moved || gesture.activeTouches !== 1) return;
+            gesture.longPressActive = true;
+            savedRateRef.current = playbackRateRef.current;
+            setIsBoosting(true);
+            void applyRate(longPressRateRef.current);
+          }, LONG_PRESS_DURATION_MS);
+        }
+      },
+      onPanResponderMove: (evt) => {
+        const { touches } = evt.nativeEvent;
+        const gesture = gestureRef.current;
+        if (touches.length >= 2) {
+          cancelLongPressTimer();
+          stopBoost();
+          if (gesture.startDistance === 0) {
+            gesture.startDistance = touchDistance(touches[0], touches[1]);
+            gesture.startScale = videoTransformRef.current.scale;
+            gesture.startCentroid = centroidOf(touches);
+            gesture.startOffset = videoTransformRef.current.offset;
+          }
+          gesture.moved = true;
+          const nextScale = Math.max(
+            MIN_VIDEO_SCALE,
+            Math.min(
+              MAX_VIDEO_SCALE,
+              (gesture.startScale * touchDistance(touches[0], touches[1])) /
+                gesture.startDistance
+            )
+          );
+          const currentCentroid = centroidOf(touches);
+          const nextOffset = clampVideoOffset(
+            {
+              x: gesture.startOffset.x + (currentCentroid.x - gesture.startCentroid.x),
+              y: gesture.startOffset.y + (currentCentroid.y - gesture.startCentroid.y),
+            },
+            nextScale
+          );
+          setVideoScale(nextScale);
+          setVideoOffset(nextOffset);
+        } else if (touches.length === 1) {
+          const dx = evt.nativeEvent.pageX - gesture.startPage.x;
+          const dy = evt.nativeEvent.pageY - gesture.startPage.y;
+          if (
+            !gesture.moved &&
+            !gesture.longPressActive &&
+            Math.hypot(dx, dy) > TAP_SLOP_PX
+          ) {
+            gesture.moved = true;
+            cancelLongPressTimer();
+            if (
+              videoTransformRef.current.scale <= 1 &&
+              Math.abs(dy) > Math.abs(dx) * 0.8
+            ) {
+              gesture.adjustSide =
+                evt.nativeEvent.pageX < containerSizeRef.current.width / 2
+                  ? 'brightness'
+                  : 'volume';
+              gesture.startBrightness = brightnessRef.current;
+              gesture.startVolume = volumeRef.current;
+            }
+          }
+          const currentScale = videoTransformRef.current.scale;
+          if (currentScale > 1 && !gesture.longPressActive) {
+            setVideoOffset(
+              clampVideoOffset(
+                { x: gesture.startOffset.x + dx, y: gesture.startOffset.y + dy },
+                currentScale
+              )
+            );
+          } else if (gesture.adjustSide !== 'none') {
+            const travelRange = containerSizeRef.current.height || 400;
+            const progress = -dy / travelRange;
+            if (gesture.adjustSide === 'brightness') {
+              applyBrightness(gesture.startBrightness + progress * BRIGHTNESS_SENSITIVITY);
+            } else {
+              applyVolume(gesture.startVolume + progress * VOLUME_SENSITIVITY);
+            }
+          }
+        }
+      },
+      onPanResponderRelease: () => {
+        const gesture = gestureRef.current;
+        cancelLongPressTimer();
+        gesture.adjustSide = 'none';
+        if (gesture.longPressActive) {
+          stopBoost();
+        } else if (!gesture.moved && gesture.activeTouches === 1) {
+          handleVideoPress();
+        }
+        gesture.moved = false;
+        gesture.startDistance = 0;
+      },
+      onPanResponderTerminate: () => {
+        const gesture = gestureRef.current;
+        cancelLongPressTimer();
+        stopBoost();
+        gesture.adjustSide = 'none';
+        gesture.moved = false;
+        gesture.startDistance = 0;
+      },
+    });
+  }, [
+    applyBrightness,
+    applyRate,
+    applyVolume,
+    cancelLongPressTimer,
+    clampVideoOffset,
+    handleVideoPress,
+    stopBoost,
+  ]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -166,26 +601,10 @@ export default function PlayerScreen() {
     }
   }, [isMuted, startHideTimer]);
 
-  const handleCycleSpeed = useCallback(async () => {
-    const currentIndex = playbackRates.indexOf(playbackRate);
-    const nextIndex = (currentIndex + 1) % playbackRates.length;
-    const newRate = playbackRates[nextIndex];
-    if (videoRef.current) {
-      await videoRef.current.setRateAsync(newRate, true);
-      setPlaybackRate(newRate);
-      startHideTimer();
-    }
-  }, [playbackRate, playbackRates, startHideTimer]);
-
-  const handleToggleFullscreen = useCallback(async () => {
-    if (videoRef.current) {
-      try {
-        await videoRef.current.presentFullscreenPlayer();
-      } catch (error) {
-        console.warn('Fullscreen video is not available on this platform:', error);
-      }
-    }
-  }, []);
+  const handleToggleSpeedMenu = useCallback(() => {
+    setShowSpeedMenu((prev) => !prev);
+    startHideTimer();
+  }, [startHideTimer]);
 
   const handleGoBack = useCallback(() => {
     router.back();
@@ -249,16 +668,30 @@ export default function PlayerScreen() {
       statusBarStyle="light"
       safeAreaEdges={[]}
     >
-      <TouchableOpacity
+      <View
         style={styles.videoContainer}
-        activeOpacity={1}
-        onPress={handleTap}
+        onLayout={(event) => {
+          setContainerSize({
+            width: event.nativeEvent.layout.width,
+            height: event.nativeEvent.layout.height,
+          });
+        }}
+        {...videoGestureResponder.panHandlers}
       >
         <Video
           ref={videoRef}
           source={{ uri }}
-          style={styles.video}
-          resizeMode={ResizeMode.COVER}
+          style={[
+            styles.video,
+            {
+              transform: [
+                { translateX: videoOffset.x },
+                { translateY: videoOffset.y },
+                { scale: videoScale },
+              ],
+            },
+          ]}
+          resizeMode={scaleMode}
           shouldPlay={isPlaying}
           isLooping={false}
           onError={(event) => {
@@ -276,12 +709,59 @@ export default function PlayerScreen() {
                 setCurrentTime(status.positionMillis as number);
               }
             }
+            const naturalSize = (
+              status as { naturalSize?: { width: number; height: number } }
+            ).naturalSize;
+            if (naturalSize && naturalSize.width > 0) {
+              const { width, height } = naturalSize;
+              const previous = naturalSizeRef.current;
+              if (!previous || previous.width !== width || previous.height !== height) {
+                naturalSizeRef.current = { width, height };
+                setVideoDimensions({ width, height });
+                if (!manualOrientationRef.current) {
+                  applyOrientationForVideo(width, height);
+                }
+              }
+            }
           }}
         />
 
         {playbackError && (
           <View style={styles.playbackErrorOverlay} pointerEvents="none">
             <Text style={styles.playbackErrorText}>{playbackError}</Text>
+          </View>
+        )}
+
+        {isBoosting && (
+          <View style={styles.boostIndicator} pointerEvents="none">
+            <Text style={styles.boostIndicatorText}>{longPressRate}x 倍速中</Text>
+          </View>
+        )}
+
+        {adjustIndicator && (
+          <View
+            style={[
+              styles.adjustIndicator,
+              adjustIndicator.side === 'volume' && styles.adjustIndicatorRight,
+            ]}
+            pointerEvents="none"
+          >
+            <FontAwesome6
+              name={adjustIndicator.side === 'brightness' ? 'sun' : 'volume-high'}
+              size={14}
+              color="#FFFFFF"
+            />
+            <Text style={styles.adjustIndicatorText}>
+              {Math.round(adjustIndicator.value * 100)}%
+            </Text>
+            <View style={styles.adjustIndicatorTrack}>
+              <View
+                style={[
+                  styles.adjustIndicatorFill,
+                  { height: `${Math.min(100, Math.max(0, adjustIndicator.value * 100))}%` },
+                ]}
+              />
+            </View>
           </View>
         )}
 
@@ -305,16 +785,53 @@ export default function PlayerScreen() {
             <Text style={styles.videoTitle} numberOfLines={1}>
               {title || 'Video'}
             </Text>
-            {!isAndroid && (
-              <View style={styles.topRight}>
-                <TouchableOpacity
-                  style={styles.controlButton}
-                  onPress={handleToggleFullscreen}
-                >
-                  <FontAwesome6 name="expand" size={16} color="#FFFFFF" />
-                </TouchableOpacity>
+            {videoDimensions && (
+              <View style={styles.resolutionBadge}>
+                <Text style={styles.resolutionText}>
+                  {getQualityLabel(videoDimensions.width, videoDimensions.height)}
+                </Text>
               </View>
             )}
+            <View style={styles.topRight}>
+              <TouchableOpacity
+                style={styles.scaleModeButton}
+                onPress={handleToggleOrientation}
+              >
+                <FontAwesome6
+                  name={
+                    orientationMode === 'landscape'
+                      ? 'arrows-left-right'
+                      : 'arrows-up-down'
+                  }
+                  size={11}
+                  color="#FFFFFF"
+                />
+                <Text style={styles.scaleModeText}>
+                  {orientationMode === 'landscape' ? '横屏' : '竖屏'}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.scaleModeButton}
+                onPress={handleCycleScaleMode}
+              >
+                <FontAwesome6
+                  name="arrows-up-down-left-right"
+                  size={11}
+                  color="#FFFFFF"
+                />
+                <Text style={styles.scaleModeText}>
+                  {SCALE_MODE_OPTIONS[scaleModeIndex].label}
+                </Text>
+              </TouchableOpacity>
+              {(videoScale !== 1 || videoOffset.x !== 0 || videoOffset.y !== 0) && (
+                <TouchableOpacity
+                  style={styles.controlButton}
+                  onPress={resetVideoTransform}
+                >
+                  <FontAwesome6 name="arrows-rotate" size={14} color="#FFFFFF" />
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
         )}
 
@@ -407,14 +924,68 @@ export default function PlayerScreen() {
 
               <TouchableOpacity
                 style={styles.speedButton}
-                onPress={handleCycleSpeed}
+                onPress={handleToggleSpeedMenu}
               >
                 <Text style={styles.speedText}>{playbackRate}x</Text>
               </TouchableOpacity>
             </View>
           </View>
         )}
-      </TouchableOpacity>
+
+        {/* Speed menu */}
+        {showSpeedMenu && showControls && (
+          <>
+            <TouchableOpacity
+              style={styles.speedMenuBackdrop}
+              activeOpacity={1}
+              onPress={() => setShowSpeedMenu(false)}
+            />
+            <View style={styles.speedMenuPanel}>
+              <Text style={styles.speedMenuSection}>播放倍速</Text>
+              <View style={styles.speedMenuRow}>
+                {playbackRates.map((rate) => {
+                  const active = playbackRate === rate;
+                  return (
+                    <TouchableOpacity
+                      key={rate}
+                      style={[styles.speedMenuItem, active && styles.speedMenuItemActive]}
+                      onPress={() => handleSelectRate(rate)}
+                    >
+                      <Text
+                        style={[styles.speedMenuText, active && styles.speedMenuTextActive]}
+                      >
+                        {rate}x
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+
+              <View style={styles.speedMenuDivider} />
+
+              <Text style={styles.speedMenuSection}>长按倍速</Text>
+              <View style={styles.speedMenuRow}>
+                {LONG_PRESS_RATE_OPTIONS.map((rate) => {
+                  const active = longPressRate === rate;
+                  return (
+                    <TouchableOpacity
+                      key={rate}
+                      style={[styles.speedMenuItem, active && styles.speedMenuItemActive]}
+                      onPress={() => handleSelectLongPressRate(rate)}
+                    >
+                      <Text
+                        style={[styles.speedMenuText, active && styles.speedMenuTextActive]}
+                      >
+                        {rate}x
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+          </>
+        )}
+      </View>
     </Screen>
   );
 }
@@ -453,9 +1024,141 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginHorizontal: 12,
   },
+  resolutionBadge: {
+    backgroundColor: '#6366F1',
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 4,
+  },
+  resolutionText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '700',
+  },
   topRight: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 8,
+  },
+  scaleModeButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    height: 30,
+    paddingHorizontal: 10,
+    borderRadius: 15,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+  },
+  scaleModeText: {
+    color: '#F1F5F9',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  boostIndicator: {
+    position: 'absolute',
+    top: '30%',
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(99,102,241,0.6)',
+  },
+  boostIndicatorText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  adjustIndicator: {
+    position: 'absolute',
+    left: 24,
+    top: '30%',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    borderRadius: 20,
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+    gap: 8,
+    width: 52,
+  },
+  adjustIndicatorRight: {
+    left: undefined,
+    right: 24,
+  },
+  adjustIndicatorText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  adjustIndicatorTrack: {
+    width: 6,
+    height: 90,
+    borderRadius: 3,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+    overflow: 'hidden',
+    justifyContent: 'flex-end',
+  },
+  adjustIndicatorFill: {
+    width: '100%',
+    backgroundColor: '#6366F1',
+  },
+  speedMenuBackdrop: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+  },
+  speedMenuPanel: {
+    position: 'absolute',
+    bottom: 130,
+    alignSelf: 'center',
+    width: 280,
+    borderRadius: 16,
+    backgroundColor: 'rgba(22,22,30,0.97)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+  },
+  speedMenuSection: {
+    color: '#94A3B8',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  speedMenuRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  speedMenuItem: {
+    minWidth: 56,
+    height: 34,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  speedMenuItemActive: {
+    backgroundColor: '#6366F1',
+  },
+  speedMenuText: {
+    color: '#CBD5E1',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  speedMenuTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  speedMenuDivider: {
+    height: 1,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    marginVertical: 12,
   },
   controlButton: {
     width: 36,

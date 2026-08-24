@@ -9,7 +9,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     ...config,
     "name": appName,
     "slug": slugAppName,
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "default",
     "icon": "./assets/images/icon.png",
     "scheme": "myapp",
@@ -23,7 +23,8 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "package": `com.anonymous.x${projectId || '0'}`
+      "package": `com.anonymous.x${projectId || '0'}`,
+      "permissions": ["android.permission.MANAGE_EXTERNAL_STORAGE"]
     },
     "web": {
       "bundler": "metro",
@@ -73,6 +74,12 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         {
           "photosPermission": `允许夜映访问您的媒体文件，以便浏览和播放视频。`,
           "isAccessMediaLocationEnabled": true
+        }
+      ],
+      [
+        "expo-screen-orientation",
+        {
+          "initialOrientation": "DEFAULT"
         }
       ]
     ],
