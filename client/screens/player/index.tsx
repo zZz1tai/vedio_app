@@ -13,7 +13,6 @@ import type { default as VideoType } from 'expo-av/build/Video';
 import { FontAwesome6 } from '@expo/vector-icons';
 import * as NavigationBar from 'expo-navigation-bar';
 import * as Brightness from 'expo-brightness';
-import * as ScreenOrientation from 'expo-screen-orientation';
 import { setStatusBarHidden } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Screen } from '@/components/Screen';
@@ -108,10 +107,7 @@ export default function PlayerScreen() {
     height: number;
   } | null>(null);
   const naturalSizeRef = useRef<{ width: number; height: number } | null>(null);
-  const [orientationMode, setOrientationMode] = useState<'auto' | 'portrait' | 'landscape'>(
-    'auto'
-  );
-  const manualOrientationRef = useRef(false);
+  const [isPlayerLandscape, setIsPlayerLandscape] = useState(false);
 
   const playbackRates = useMemo(() => [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], []);
 
@@ -270,51 +266,11 @@ export default function PlayerScreen() {
     setShowSpeedMenu(false);
   }, []);
 
-  useEffect(() => {
-    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.DEFAULT).catch(
-      (error) => {
-        console.warn('Unable to reset orientation:', error);
-      }
-    );
-  }, []);
-
-  const applyOrientationForVideo = useCallback((width: number, height: number) => {
-    if (!width || !height) {
-      ScreenOrientation.unlockAsync().catch(() => undefined);
-      return;
-    }
-    if (height >= width) {
-      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(
-        () => undefined
-      );
-    } else {
-      ScreenOrientation.unlockAsync().catch(() => undefined);
-    }
-  }, []);
-
-  useEffect(() => {
-    manualOrientationRef.current = false;
-    setOrientationMode('auto');
-  }, [uri]);
-
-  const handleToggleOrientation = useCallback(async () => {
-    manualOrientationRef.current = true;
-    const nextMode: 'portrait' | 'landscape' =
-      orientationMode === 'landscape' ? 'portrait' : 'landscape';
-    setOrientationMode(nextMode);
-    try {
-      if (nextMode === 'landscape') {
-        await ScreenOrientation.lockAsync(
-          ScreenOrientation.OrientationLock.LANDSCAPE
-        );
-      } else {
-        await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
-      }
-    } catch (error) {
-      console.warn('Unable to change orientation lock:', error);
-    }
+  const handleTogglePlayerOrientation = useCallback(() => {
+    setIsPlayerLandscape((previous) => !previous);
+    resetVideoTransform();
     startHideTimer();
-  }, [orientationMode, startHideTimer]);
+  }, [resetVideoTransform, startHideTimer]);
 
   const handleCycleScaleMode = useCallback(() => {
     setScaleModeIndex((prev) => (prev + 1) % SCALE_MODE_OPTIONS.length);
@@ -642,6 +598,15 @@ export default function PlayerScreen() {
   }, []);
 
   const hasVideoUri = typeof uri === 'string' && uri.trim().length > 0;
+  const rotatedVideoFrame =
+    isPlayerLandscape && containerSize.width > 0 && containerSize.height > 0
+      ? {
+          width: containerSize.height,
+          height: containerSize.width,
+          left: (containerSize.width - containerSize.height) / 2,
+          top: (containerSize.height - containerSize.width) / 2,
+        }
+      : undefined;
 
   if (!hasVideoUri) {
     return (
@@ -683,11 +648,14 @@ export default function PlayerScreen() {
           source={{ uri }}
           style={[
             styles.video,
+            isPlayerLandscape && styles.videoLandscape,
+            rotatedVideoFrame,
             {
               transform: [
                 { translateX: videoOffset.x },
                 { translateY: videoOffset.y },
                 { scale: videoScale },
+                ...(isPlayerLandscape ? [{ rotate: '90deg' }] : []),
               ],
             },
           ]}
@@ -718,9 +686,6 @@ export default function PlayerScreen() {
               if (!previous || previous.width !== width || previous.height !== height) {
                 naturalSizeRef.current = { width, height };
                 setVideoDimensions({ width, height });
-                if (!manualOrientationRef.current) {
-                  applyOrientationForVideo(width, height);
-                }
               }
             }
           }}
@@ -793,23 +758,6 @@ export default function PlayerScreen() {
               </View>
             )}
             <View style={styles.topRight}>
-              <TouchableOpacity
-                style={styles.scaleModeButton}
-                onPress={handleToggleOrientation}
-              >
-                <FontAwesome6
-                  name={
-                    orientationMode === 'landscape'
-                      ? 'arrows-left-right'
-                      : 'arrows-up-down'
-                  }
-                  size={11}
-                  color="#FFFFFF"
-                />
-                <Text style={styles.scaleModeText}>
-                  {orientationMode === 'landscape' ? '横屏' : '竖屏'}
-                </Text>
-              </TouchableOpacity>
               <TouchableOpacity
                 style={styles.scaleModeButton}
                 onPress={handleCycleScaleMode}
@@ -928,6 +876,21 @@ export default function PlayerScreen() {
               >
                 <Text style={styles.speedText}>{playbackRate}x</Text>
               </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.orientationButton}
+                onPress={handleTogglePlayerOrientation}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  isPlayerLandscape ? '切换播放器为竖屏' : '切换播放器为横屏'
+                }
+              >
+                <FontAwesome6
+                  name={isPlayerLandscape ? 'arrows-up-down' : 'arrows-left-right'}
+                  size={15}
+                  color="#FFFFFF"
+                />
+              </TouchableOpacity>
             </View>
           </View>
         )}
@@ -995,9 +958,14 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000000',
     position: 'relative',
+    overflow: 'hidden',
   },
   video: {
     flex: 1,
+  },
+  videoLandscape: {
+    position: 'absolute',
+    flex: 0,
   },
   topOverlay: {
     position: 'absolute',
@@ -1232,7 +1200,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'center',
-    gap: 20,
+    gap: 4,
   },
   controlIconButton: {
     width: 40,
@@ -1252,6 +1220,14 @@ const styles = StyleSheet.create({
     minWidth: 44,
     height: 32,
     paddingHorizontal: 8,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  orientationButton: {
+    width: 36,
+    height: 32,
     borderRadius: 8,
     backgroundColor: 'rgba(255,255,255,0.1)',
     justifyContent: 'center',

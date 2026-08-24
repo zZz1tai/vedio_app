@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -12,23 +12,29 @@ import {
   StyleSheet,
   TextInput,
   Modal,
+  AppState,
+  Keyboard,
 } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
 import * as MediaLibrary from 'expo-media-library';
 import * as IntentLauncher from 'expo-intent-launcher';
 import * as Application from 'expo-application';
-import { File } from 'expo-file-system';
 import { Screen } from '@/components/Screen';
 import { VideoThumbnail } from '@/components/VideoThumbnail';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useFocusEffect } from 'expo-router';
 import { formatFileSize, formatDuration, getQualityLabel } from '@/utils/format';
-import { hasAllFilesAccess, scanDeviceForVideos } from '@/utils/videoScanner';
+import {
+  hasAllFilesAccess,
+  renameVideoFile,
+  scanDeviceForVideos,
+} from '@/utils/videoScanner';
 import { useCSSVariable } from 'uniwind';
 import { useThemePreference, type ThemePreference } from '@/contexts/ThemeContext';
 
 const { width: screenWidth } = Dimensions.get('window');
 const GRID_GAP = 12;
+const GRID_COLUMNS = 2;
 const CARD_WIDTH = (screenWidth - GRID_GAP * 3) / 2;
 
 interface VideoItem {
@@ -48,10 +54,68 @@ const toMilliseconds = (value: number) => (value > 1e12 ? value : value * 1000);
 const normalizePath = (uri: string) =>
   uri.replace(/^file:\/\//, '').toLowerCase();
 
+function decodeUriPath(uri: string): string {
+  if (!uri.startsWith('file://')) return '';
+  const rawPath = uri.slice('file://'.length);
+  try {
+    return decodeURIComponent(rawPath);
+  } catch {
+    return rawPath;
+  }
+}
+
+const searchHaystackCache = new WeakMap<VideoItem, string>();
+
+function getSearchHaystack(video: VideoItem): string {
+  let cached = searchHaystackCache.get(video);
+  if (cached === undefined) {
+    cached = `${video.filename}\n${decodeUriPath(video.uri)}`.toLowerCase();
+    searchHaystackCache.set(video, cached);
+  }
+  return cached;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function renderHighlightedFilename(
+  text: string,
+  tokens: string[],
+  accentColor: string
+): React.ReactNode[] {
+  if (tokens.length === 0) return [text];
+  const pattern = tokens.map(escapeRegExp).join('|');
+  const parts = text.split(new RegExp(`(${pattern})`, 'gi'));
+  return parts.map((part, index) =>
+    tokens.indexOf(part.toLowerCase()) !== -1 ? (
+      <Text key={index} style={{ color: accentColor }}>
+        {part}
+      </Text>
+    ) : (
+      <React.Fragment key={index}>{part}</React.Fragment>
+    )
+  );
+}
+
 interface VideoGroup {
   key: string;
   title: string;
   data: VideoItem[];
+}
+
+interface VideoSection {
+  key: string;
+  title: string;
+  data: VideoItem[][];
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -210,21 +274,30 @@ export default function HomeScreen() {
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [grouped, setGrouped] = useState(false);
   const [groupBy, setGroupBy] = useState<'folder' | 'date'>('folder');
+  const [searchDraft, setSearchDraft] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [renameTarget, setRenameTarget] = useState<VideoItem | null>(null);
   const [renameText, setRenameText] = useState('');
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [allFilesAccessGranted, setAllFilesAccessGranted] = useState(true);
+  const pendingAllFilesRecheck = useRef(false);
 
-  const isSearching = searchQuery.trim().length > 0;
+  const isSearching = searchQuery.length > 0;
+  const searchTokens = useMemo(() => {
+    if (!isSearching) return [];
+    return searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+  }, [isSearching, searchQuery]);
   const filteredVideos = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-    if (!query) return videos;
-    return videos.filter((video) => video.filename.toLowerCase().includes(query));
-  }, [videos, searchQuery]);
+    if (searchTokens.length === 0) return videos;
+    return videos.filter((video) => {
+      const haystack = getSearchHaystack(video);
+      return searchTokens.every((token) => haystack.includes(token));
+    });
+  }, [videos, searchTokens]);
 
   const videoGroups = useMemo<VideoGroup[]>(() => {
+    if (searchTokens.length > 0) return [];
     const buckets = new Map<string, VideoGroup>();
 
     for (const video of filteredVideos) {
@@ -255,7 +328,16 @@ export default function HomeScreen() {
       );
     }
     return groups;
-  }, [filteredVideos, groupBy]);
+  }, [filteredVideos, groupBy, searchTokens]);
+
+  const groupedSections = useMemo<VideoSection[]>(
+    () =>
+      videoGroups.map((section) => ({
+        ...section,
+        data: chunkArray(section.data, viewMode === 'grid' ? GRID_COLUMNS : 1),
+      })),
+    [videoGroups, viewMode]
+  );
 
   const requestPermission = useCallback(async () => {
     try {
@@ -375,6 +457,16 @@ export default function HomeScreen() {
     }, [hasInitialized, loadVideos, refreshPermission])
   );
 
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active' || !pendingAllFilesRecheck.current) return;
+      pendingAllFilesRecheck.current = false;
+      if (!permissionGranted) return;
+      loadVideos();
+    });
+    return () => subscription.remove();
+  }, [loadVideos, permissionGranted]);
+
   const handlePlayVideo = useCallback(
     (video: VideoItem) => {
       router.push('/player', {
@@ -409,14 +501,38 @@ export default function HomeScreen() {
     setRenameError(null);
   }, []);
 
-  const requestAllFilesAccess = useCallback(() => {
+  const handleSearchSubmit = useCallback(() => {
+    setSearchQuery(searchDraft.trim());
+    Keyboard.dismiss();
+  }, [searchDraft]);
+
+  const handleSearchClear = useCallback(() => {
+    setSearchDraft('');
+    setSearchQuery('');
+    Keyboard.dismiss();
+  }, []);
+
+  const requestAllFilesAccess = useCallback(async () => {
+    const applicationId = Application.applicationId;
+    if (!applicationId) return;
+    pendingAllFilesRecheck.current = true;
     try {
-      IntentLauncher.startActivityAsync(
+      await IntentLauncher.startActivityAsync(
         IntentLauncher.ActivityAction.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-        { data: `package:${Application.applicationId ?? ''}` }
+        { data: `package:${applicationId}` }
       );
-    } catch (error) {
-      console.warn('Unable to open all-files-access settings:', error);
+    } catch {
+      try {
+        await IntentLauncher.startActivityAsync(
+          IntentLauncher.ActivityAction.MANAGE_ALL_FILES_ACCESS_PERMISSION
+        );
+      } catch (error) {
+        console.warn('Unable to open all-files-access settings:', error);
+        pendingAllFilesRecheck.current = false;
+        Linking.openSettings().catch((error) => {
+          console.warn('Unable to open app settings:', error);
+        });
+      }
     }
   }, []);
 
@@ -445,12 +561,19 @@ export default function HomeScreen() {
     setRenameError(null);
 
     const dirUri = renameTarget.uri.slice(0, renameTarget.uri.lastIndexOf('/'));
+    const targetUri = `${dirUri}/${finalName}`;
     try {
-      new File(renameTarget.uri).move(new File(dirUri, finalName));
+      const renamed = renameVideoFile(renameTarget.uri, targetUri);
+      if (!renamed) {
+        setRenameError(
+          '重命名失败，请确认已授予「所有文件访问」权限后重试'
+        );
+        return;
+      }
       setVideos((prev) =>
         prev.map((video) =>
           video.id === renameTarget.id
-            ? { ...video, filename: finalName, uri: `${dirUri}/${finalName}` }
+            ? { ...video, filename: finalName, uri: targetUri }
             : video
         )
       );
@@ -491,7 +614,7 @@ export default function HomeScreen() {
             </View>
             <View style={styles.listInfo}>
               <Text style={styles.listTitle} numberOfLines={2}>
-                {item.filename}
+                {renderHighlightedFilename(item.filename, searchTokens, c.accent)}
               </Text>
               <View style={styles.listMeta}>
                 {qualityLabel && (
@@ -553,7 +676,7 @@ export default function HomeScreen() {
           </View>
           <View style={styles.gridInfo}>
             <Text style={styles.gridTitle} numberOfLines={2}>
-              {item.filename}
+              {renderHighlightedFilename(item.filename, searchTokens, c.accent)}
             </Text>
             <Text style={styles.gridMeta} numberOfLines={1}>
               {item.width > 0 && item.height > 0
@@ -565,7 +688,23 @@ export default function HomeScreen() {
         </TouchableOpacity>
       );
     },
-    [handlePlayVideo, openRenameDialog, viewMode]
+    [handlePlayVideo, openRenameDialog, viewMode, searchTokens]
+  );
+
+  const renderGroupedRow = useCallback(
+    ({ item }: { item: VideoItem[] }) => {
+      if (item.length === 1) {
+        return renderVideoCard({ item: item[0] });
+      }
+      return (
+        <View style={styles.gridRow}>
+          {item.map((video) => (
+            <View key={video.id}>{renderVideoCard({ item: video })}</View>
+          ))}
+        </View>
+      );
+    },
+    [renderVideoCard]
   );
 
   if (loading) {
@@ -681,24 +820,42 @@ export default function HomeScreen() {
         <FontAwesome6 name="magnifying-glass" size={14} color={c.muted} />
         <TextInput
           style={styles.searchInput}
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-          placeholder="搜索视频文件名..."
+          value={searchDraft}
+          onChangeText={setSearchDraft}
+          placeholder="搜索文件名或所在文件夹，空格分隔多个关键词"
           placeholderTextColor={c.muted}
           autoCorrect={false}
           autoCapitalize="none"
           returnKeyType="search"
+          onSubmitEditing={handleSearchSubmit}
         />
-        {isSearching && (
+        {isSearching ? (
           <TouchableOpacity
             style={styles.searchClearButton}
-            onPress={() => setSearchQuery('')}
+            onPress={handleSearchClear}
             hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
           >
             <FontAwesome6 name="xmark" size={13} color={c.muted} />
           </TouchableOpacity>
-        )}
+        ) : searchDraft.trim().length > 0 ? (
+          <TouchableOpacity
+            style={styles.searchConfirmButton}
+            onPress={handleSearchSubmit}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
+            <FontAwesome6 name="arrow-right" size={13} color={c.accent} />
+          </TouchableOpacity>
+        ) : null}
       </View>
+
+      {isSearching && filteredVideos.length > 0 && (
+        <View style={styles.searchSummary}>
+          <FontAwesome6 name="magnifying-glass" size={11} color={c.muted} />
+          <Text style={styles.searchSummaryText}>
+            找到 {filteredVideos.length} 个相关视频
+          </Text>
+        </View>
+      )}
 
       {!allFilesAccessGranted && (
         <TouchableOpacity
@@ -728,20 +885,24 @@ export default function HomeScreen() {
           <Text style={styles.emptyTitle}>未找到匹配的视频</Text>
           <Text style={styles.emptyDesc}>换个关键词试试</Text>
         </View>
-      ) : grouped ? (
-        <SectionList
-          sections={videoGroups}
-          keyExtractor={(item) => item.id}
-          renderItem={renderVideoCard}
+      ) : grouped && !isSearching ? (
+        <SectionList<VideoItem[], VideoSection>
+          sections={groupedSections}
+          keyExtractor={(item) => item[0].id}
+          renderItem={renderGroupedRow}
           renderSectionHeader={({ section }) => (
             <View style={styles.sectionHeader}>
               <FontAwesome6 name="folder" size={12} color={c.accent} />
               <Text style={styles.sectionTitle}>{section.title}</Text>
-              <Text style={styles.sectionCount}>{section.data.length}</Text>
+              <Text style={styles.sectionCount}>
+                {section.data.reduce((sum, row) => sum + row.length, 0)}
+              </Text>
             </View>
           )}
           stickySectionHeadersEnabled={false}
-          contentContainerStyle={styles.listList}
+          contentContainerStyle={
+            viewMode === 'grid' ? styles.gridList : styles.listList
+          }
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
           ItemSeparatorComponent={() => <View style={styles.listSeparator} />}
@@ -991,6 +1152,10 @@ function createStyles(c: ThemePalette) {
     paddingHorizontal: GRID_GAP,
     paddingBottom: 40,
   },
+  gridRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
   gridCard: {
     width: CARD_WIDTH,
     marginHorizontal: GRID_GAP / 2,
@@ -1147,6 +1312,23 @@ function createStyles(c: ThemePalette) {
     height: 20,
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  searchConfirmButton: {
+    width: 20,
+    height: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  searchSummary: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginHorizontal: 16,
+    marginBottom: 8,
+  },
+  searchSummaryText: {
+    color: c.muted,
+    fontSize: 12,
   },
   accessBanner: {
     flexDirection: 'row',

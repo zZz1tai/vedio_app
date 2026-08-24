@@ -1,4 +1,12 @@
 import { Directory, File } from 'expo-file-system';
+import { NativeModules, Platform } from 'react-native';
+
+const NativeStorageAccess = NativeModules.StorageAccess as
+  | {
+      isAllFilesAccessGranted?: () => boolean;
+      renameFile?: (sourceUri: string, targetUri: string) => boolean;
+    }
+  | undefined;
 
 const VIDEO_EXTENSIONS = new Set([
   '.mp4',
@@ -48,11 +56,53 @@ export interface ScannedVideo {
   modificationTime: number;
 }
 
+const WRITE_PROBE_DIR_NAMES = ['Download', 'DCIM', 'Pictures'];
+
 export async function hasAllFilesAccess(): Promise<boolean> {
   try {
+    if (
+      Platform.OS === 'android' &&
+      typeof NativeStorageAccess?.isAllFilesAccessGranted === 'function'
+    ) {
+      return NativeStorageAccess.isAllFilesAccessGranted();
+    }
+
     const root = new Directory(PRIMARY_STORAGE_ROOT);
     if (!root.exists) return false;
-    return root.list().length > 0;
+
+    let entries: (Directory | File)[];
+    try {
+      entries = root.list();
+    } catch {
+      return false;
+    }
+    if (entries.length === 0) return false;
+
+    for (const name of WRITE_PROBE_DIR_NAMES) {
+      const candidate = new Directory(root, name);
+      if (!candidate.exists) continue;
+      try {
+        candidate.create({ idempotent: true });
+        return true;
+      } catch {
+        continue;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export function renameVideoFile(sourceUri: string, targetUri: string): boolean {
+  if (typeof NativeStorageAccess?.renameFile === 'function') {
+    return NativeStorageAccess.renameFile(sourceUri, targetUri);
+  }
+  try {
+    const dirUri = targetUri.slice(0, targetUri.lastIndexOf('/'));
+    const newName = targetUri.slice(targetUri.lastIndexOf('/') + 1);
+    new File(sourceUri).move(new File(dirUri, newName));
+    return true;
   } catch {
     return false;
   }
