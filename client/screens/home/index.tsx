@@ -16,6 +16,7 @@ import {
   Keyboard,
 } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as MediaLibrary from 'expo-media-library';
 import * as IntentLauncher from 'expo-intent-launcher';
 import * as Application from 'expo-application';
@@ -203,6 +204,7 @@ const THEME_CYCLE_ORDER: ThemePreference[] = ['system', 'light', 'dark'];
 
 export default function HomeScreen() {
   const router = useSafeRouter();
+  const insets = useSafeAreaInsets();
   const { preference, setPreference: setThemePreference } = useThemePreference();
   const [
     background,
@@ -741,7 +743,7 @@ export default function HomeScreen() {
 
   return (
     <Screen backgroundColor={c.background} statusBarStyle={statusBarStyle} safeAreaEdges={['left', 'right']}>
-      <View style={styles.header}>
+      <View style={[styles.header, { paddingTop: Platform.OS === 'web' ? 20 : insets.top + 12 }]}>
         <View style={styles.headerLeft}>
           <Text style={styles.headerTitle}>视频播放器</Text>
           <Text style={styles.headerSubtitle}>
@@ -751,6 +753,12 @@ export default function HomeScreen() {
           </Text>
         </View>
         <View style={styles.headerActions}>
+          <TouchableOpacity
+            style={styles.viewToggle}
+            onPress={() => router.push('/bili-import')}
+          >
+            <FontAwesome6 name="clapperboard" size={15} color={c.muted} />
+          </TouchableOpacity>
           <TouchableOpacity
             style={styles.viewToggle}
             onPress={handleCycleTheme}

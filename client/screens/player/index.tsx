@@ -8,21 +8,27 @@ import {
   PanResponder,
   LayoutChangeEvent,
 } from 'react-native';
-import { Video, ResizeMode } from 'expo-av';
-import type { default as VideoType } from 'expo-av/build/Video';
 import { FontAwesome6 } from '@expo/vector-icons';
 import * as NavigationBar from 'expo-navigation-bar';
 import * as Brightness from 'expo-brightness';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setStatusBarHidden } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import {
+  AppVideo,
+  ENHANCEMENT_LEVELS,
+  isMpvSupported,
+  type AppVideoRef,
+  type EnhancementLevel,
+} from '@/components/AppVideo';
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import { formatDuration, getQualityLabel } from '@/utils/format';
 
 const SCALE_MODE_OPTIONS = [
-  { mode: ResizeMode.CONTAIN, label: '默认' },
-  { mode: ResizeMode.COVER, label: '填充' },
-  { mode: ResizeMode.STRETCH, label: '拉伸' },
+  { mode: 'contain', label: '默认' },
+  { mode: 'cover', label: '填充' },
+  { mode: 'stretch', label: '拉伸' },
 ] as const;
 
 const MIN_VIDEO_SCALE = 0.5;
@@ -58,14 +64,17 @@ export default function PlayerScreen() {
     duration: number;
   }>();
 
-  const videoRef = useRef<VideoType>(null);
+  const videoRef = useRef<AppVideoRef>(null);
   const [isPlaying, setIsPlaying] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(durationParam ? durationParam * 1000 : 0);
   const [showControls, setShowControls] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [volumeLevel, setVolumeLevel] = useState(1);
+  const [enhancement, setEnhancement] = useState<EnhancementLevel>('off');
   const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [engineFallbackReason, setEngineFallbackReason] = useState<string | null>(null);
   const hideControlsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isPlayingRef = useRef(isPlaying);
   const isMutedRef = useRef(isMuted);
@@ -106,7 +115,6 @@ export default function PlayerScreen() {
     width: number;
     height: number;
   } | null>(null);
-  const naturalSizeRef = useRef<{ width: number; height: number } | null>(null);
   const [isPlayerLandscape, setIsPlayerLandscape] = useState(false);
 
   const playbackRates = useMemo(() => [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], []);
@@ -114,6 +122,11 @@ export default function PlayerScreen() {
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  useEffect(() => {
+    setPlaybackError(null);
+    setEngineFallbackReason(null);
+  }, [uri]);
 
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -165,14 +178,8 @@ export default function PlayerScreen() {
   const [longPressRate, setLongPressRate] = useState(2.0);
   const [isBoosting, setIsBoosting] = useState(false);
   const [showSpeedMenu, setShowSpeedMenu] = useState(false);
-  const playbackRateRef = useRef(playbackRate);
   const longPressRateRef = useRef(longPressRate);
-  const savedRateRef = useRef(1.0);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    playbackRateRef.current = playbackRate;
-  }, [playbackRate]);
 
   useEffect(() => {
     longPressRateRef.current = longPressRate;
@@ -183,15 +190,6 @@ export default function PlayerScreen() {
       setShowSpeedMenu(false);
     }
   }, [showControls, showSpeedMenu]);
-
-  const applyRate = useCallback(async (rate: number) => {
-    if (!videoRef.current) return;
-    try {
-      await videoRef.current.setRateAsync(rate, true);
-    } catch (error) {
-      console.warn('Unable to change playback rate:', error);
-    }
-  }, []);
 
   useEffect(() => {
     Brightness.getBrightnessAsync()
@@ -240,8 +238,8 @@ export default function PlayerScreen() {
     (value: number) => {
       const clamped = Math.min(1, Math.max(0, value));
       volumeRef.current = clamped;
+      setVolumeLevel(clamped);
       showAdjustIndicator('volume', clamped);
-      void videoRef.current?.setVolumeAsync(clamped);
       if (clamped === 0 && !isMutedRef.current) {
         setIsMuted(true);
       } else if (clamped > 0 && isMutedRef.current) {
@@ -254,17 +252,43 @@ export default function PlayerScreen() {
   const handleSelectRate = useCallback(
     (rate: number) => {
       setPlaybackRate(rate);
-      void applyRate(rate);
       setShowSpeedMenu(false);
       startHideTimer();
     },
-    [applyRate, startHideTimer]
+    [startHideTimer]
   );
 
   const handleSelectLongPressRate = useCallback((rate: number) => {
     setLongPressRate(rate);
     setShowSpeedMenu(false);
   }, []);
+
+  // Anime4K 增强档位：读取/持久化
+  useEffect(() => {
+    AsyncStorage.getItem('player.enhancement')
+      .then((value) => {
+        if (value === 'low' || value === 'medium' || value === 'high' || value === 'off') {
+          setEnhancement(value);
+        }
+      })
+      .catch((error) => {
+        console.warn('Unable to read enhancement level:', error);
+      });
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.setItem('player.enhancement', enhancement).catch((error) => {
+      console.warn('Unable to persist enhancement level:', error);
+    });
+  }, [enhancement]);
+
+  const handleCycleEnhancement = useCallback(() => {
+    setEnhancement((previous) => {
+      const index = ENHANCEMENT_LEVELS.findIndex((item) => item.value === previous);
+      return ENHANCEMENT_LEVELS[(index + 1) % ENHANCEMENT_LEVELS.length].value;
+    });
+    startHideTimer();
+  }, [startHideTimer]);
 
   const handleTogglePlayerOrientation = useCallback(() => {
     setIsPlayerLandscape((previous) => !previous);
@@ -330,8 +354,7 @@ export default function PlayerScreen() {
     if (!gesture.longPressActive) return;
     gesture.longPressActive = false;
     setIsBoosting(false);
-    void applyRate(savedRateRef.current);
-  }, [applyRate]);
+  }, []);
 
   const videoGestureResponder = useMemo(() => {
     // eslint-disable-next-line react-hooks/refs
@@ -356,9 +379,7 @@ export default function PlayerScreen() {
             longPressTimerRef.current = null;
             if (gesture.moved || gesture.activeTouches !== 1) return;
             gesture.longPressActive = true;
-            savedRateRef.current = playbackRateRef.current;
             setIsBoosting(true);
-            void applyRate(longPressRateRef.current);
           }, LONG_PRESS_DURATION_MS);
         }
       },
@@ -457,7 +478,6 @@ export default function PlayerScreen() {
     });
   }, [
     applyBrightness,
-    applyRate,
     applyVolume,
     cancelLongPressTimer,
     clampVideoOffset,
@@ -507,55 +527,44 @@ export default function PlayerScreen() {
     };
   }, []);
 
-  const handlePlayPause = useCallback(async () => {
-    if (videoRef.current) {
-      if (isPlaying) {
-        await videoRef.current.pauseAsync();
-      } else {
-        await videoRef.current.playAsync();
-      }
-      setIsPlaying((previous) => !previous);
-    }
-  }, [isPlaying, startHideTimer]);
+  const handlePlayPause = useCallback(() => {
+    setIsPlaying((previous) => !previous);
+  }, []);
 
-  const handleSeek = useCallback(
-    async (value: number) => {
-      if (videoRef.current && duration > 0 && progressBarWidth > 0) {
-        const clampedValue = Math.max(0, Math.min(100, value));
-        const seekPosition = (clampedValue / 100) * duration;
-        await videoRef.current.setPositionAsync(seekPosition);
-        setCurrentTime(seekPosition);
-        startHideTimer();
-      }
-    },
-    [duration, progressBarWidth, startHideTimer]
-  );
-
-  const handleSkip = useCallback(
-    async (seconds: number) => {
-      if (videoRef.current) {
-        const status = await videoRef.current.getStatusAsync();
-        if ('positionMillis' in status) {
-          const newPosition = Math.max(
-            0,
-            Math.min(status.positionMillis + seconds * 1000, duration)
-          );
-          await videoRef.current.setPositionAsync(newPosition);
-          setCurrentTime(newPosition);
-          startHideTimer();
-        }
-      }
+  const performSeek = useCallback(
+    (positionMs: number) => {
+      const clamped = duration > 0 ? Math.max(0, Math.min(positionMs, duration)) : Math.max(0, positionMs);
+      videoRef.current?.seek(clamped);
+      setCurrentTime(clamped);
+      startHideTimer();
     },
     [duration, startHideTimer]
   );
 
-  const handleMuteToggle = useCallback(async () => {
-    if (videoRef.current) {
-      await videoRef.current.setIsMutedAsync(!isMuted);
-      setIsMuted(!isMuted);
-      startHideTimer();
-    }
-  }, [isMuted, startHideTimer]);
+  const handleSeek = useCallback(
+    (value: number) => {
+      if (duration > 0 && progressBarWidth > 0) {
+        const clampedValue = Math.max(0, Math.min(100, value));
+        const seekPosition = (clampedValue / 100) * duration;
+        performSeek(seekPosition);
+      }
+    },
+    [duration, performSeek, progressBarWidth]
+  );
+
+  const handleSkip = useCallback(
+    (seconds: number) => {
+      if (duration > 0) {
+        performSeek(Math.min(currentTime + seconds * 1000, duration));
+      }
+    },
+    [currentTime, duration, performSeek]
+  );
+
+  const handleMuteToggle = useCallback(() => {
+    setIsMuted((previous) => !previous);
+    startHideTimer();
+  }, [startHideTimer]);
 
   const handleToggleSpeedMenu = useCallback(() => {
     setShowSpeedMenu((prev) => !prev);
@@ -643,9 +652,9 @@ export default function PlayerScreen() {
         }}
         {...videoGestureResponder.panHandlers}
       >
-        <Video
+        <AppVideo
           ref={videoRef}
-          source={{ uri }}
+          source={uri}
           style={[
             styles.video,
             isPlayerLandscape && styles.videoLandscape,
@@ -659,41 +668,52 @@ export default function PlayerScreen() {
               ],
             },
           ]}
+          paused={!isPlaying}
+          rate={isBoosting ? longPressRate : playbackRate}
+          volume={volumeLevel}
+          muted={isMuted}
           resizeMode={scaleMode}
-          shouldPlay={isPlaying}
-          isLooping={false}
-          onError={(event) => {
-            console.error('Video error:', event);
-            setIsPlaying(false);
-            setPlaybackError('此视频无法播放，可能是文件已删除或格式不受支持。');
+          enhancement={enhancement}
+          onLoad={({ durationMs }) => {
+            setPlaybackError(null);
+            if (durationMs > 0) {
+              setDuration(durationMs);
+            }
           }}
-          onPlaybackStatusUpdate={(status) => {
-            if ('isPlaying' in status) {
-              setIsPlaying(status.isPlaying);
-              if ('durationMillis' in status && status.durationMillis) {
-                setDuration(status.durationMillis);
-              }
-              if ('positionMillis' in status) {
-                setCurrentTime(status.positionMillis as number);
-              }
-            }
-            const naturalSize = (
-              status as { naturalSize?: { width: number; height: number } }
-            ).naturalSize;
-            if (naturalSize && naturalSize.width > 0) {
-              const { width, height } = naturalSize;
-              const previous = naturalSizeRef.current;
-              if (!previous || previous.width !== width || previous.height !== height) {
-                naturalSizeRef.current = { width, height };
-                setVideoDimensions({ width, height });
-              }
-            }
+          onProgress={({ positionMs }) => {
+            setCurrentTime(positionMs);
+          }}
+          onPlayingChange={({ playing }) => {
+            setIsPlaying(playing);
+          }}
+          onEnded={() => {
+            setIsPlaying(false);
+            setShowControls(true);
+          }}
+          onDimensions={({ width, height }) => {
+            setVideoDimensions({ width, height });
+          }}
+          onError={(payload) => {
+            setIsPlaying(false);
+            const detail = payload?.message ? `（${payload.message}）` : '';
+            setPlaybackError(`此视频无法播放，可能是文件已删除或格式不受支持。${detail}`);
+          }}
+          onFallback={(reason) => {
+            setEngineFallbackReason(reason ?? '未知原因');
           }}
         />
 
         {playbackError && (
           <View style={styles.playbackErrorOverlay} pointerEvents="none">
             <Text style={styles.playbackErrorText}>{playbackError}</Text>
+          </View>
+        )}
+
+        {engineFallbackReason && (
+          <View style={styles.fallbackBadge} pointerEvents="none">
+            <Text style={styles.fallbackBadgeText} numberOfLines={2}>
+              兼容模式播放（无增强）· mpv：{engineFallbackReason}
+            </Text>
           </View>
         )}
 
@@ -758,6 +778,18 @@ export default function PlayerScreen() {
               </View>
             )}
             <View style={styles.topRight}>
+              {isMpvSupported && (
+                <TouchableOpacity
+                  style={styles.scaleModeButton}
+                  onPress={handleCycleEnhancement}
+                >
+                  <FontAwesome6 name="wand-magic-sparkles" size={11} color="#FFFFFF" />
+                  <Text style={styles.scaleModeText}>
+                    {ENHANCEMENT_LEVELS.find((item) => item.value === enhancement)?.label ??
+                      '原生'}
+                  </Text>
+                </TouchableOpacity>
+              )}
               <TouchableOpacity
                 style={styles.scaleModeButton}
                 onPress={handleCycleScaleMode}
@@ -1281,6 +1313,21 @@ const styles = StyleSheet.create({
   playbackErrorText: {
     color: '#FFFFFF',
     fontSize: 14,
+    textAlign: 'center',
+  },
+  fallbackBadge: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderRadius: 8,
+    bottom: 96,
+    maxWidth: '86%',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    position: 'absolute',
+  },
+  fallbackBadgeText: {
+    color: '#FFD54F',
+    fontSize: 12,
     textAlign: 'center',
   },
 });

@@ -1,0 +1,7 @@
+{
+  "name": "expo-mpv",
+  "version": "1.0.0",
+  "description": "libmpv-based video view with Anime4K shader support",
+  "main": "src/index.tsx",
+  "private": true
+}

@@ -105,3 +105,4 @@ node-compile-cache/
 .codegraph/
 
 *.apk
+nohup.out

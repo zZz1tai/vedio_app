@@ -12,6 +12,10 @@ config.resolver.blockList = [
   ...existingBlockList,
   /.*\/\.expo\/.*/, // Expo 的缓存和构建产物目录
 
+  // 原生构建产物（Gradle 编译时目录会被删除重建，监视会导致 Metro 崩溃）
+  /.*\/android\/build\/.*/,
+  /.*\/android\/\.gradle\/.*/,
+
   // 1. 原生代码 (Java/C++/Objective-C)
   /.*\/react-native\/ReactAndroid\/.*/,
   /.*\/react-native\/ReactCommon\/.*/,
@@ -31,6 +35,18 @@ config.resolver.blockList = [
   // 5. pnpm 临时目录（避免 ENOENT 错误）
   /.*node_modules\/\.pnpm\/.*_tmp_\d+.*/,
 ];
+
+// 文件监视排除：Gradle 构建目录会被反复删除重建，
+// 监视它们会导致 metro-file-map 的 watcher 抛 ENOENT 并使整个 Metro 进程崩溃
+config.watcher = {
+  ...config.watcher,
+  unwatchPatterns: [
+    ...(config.watcher?.unwatchPatterns || []),
+    '**/android/build/**',
+    '**/android/.gradle/**',
+    '**/android/app/build/**',
+  ],
+};
 
 const BACKEND_TARGET = 'http://localhost:9091';
 

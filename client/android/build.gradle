@@ -2,6 +2,9 @@
 
 buildscript {
   repositories {
+    // 阿里云镜像优先（repo1.maven.org / dl.google.com 当前网络不可达）
+    maven { url 'https://maven.aliyun.com/repository/google' }
+    maven { url 'https://maven.aliyun.com/repository/central' }
     google()
     mavenCentral()
   }
@@ -14,6 +17,8 @@ buildscript {
 
 allprojects {
   repositories {
+    maven { url 'https://maven.aliyun.com/repository/google' }
+    maven { url 'https://maven.aliyun.com/repository/central' }
     google()
     mavenCentral()
     maven { url 'https://www.jitpack.io' }
