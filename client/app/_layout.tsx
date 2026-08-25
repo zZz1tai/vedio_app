@@ -24,6 +24,7 @@ export default function RootLayout() {
       >
         <Stack.Screen name="index" options={{ title: "" }} />
         <Stack.Screen name="player" options={{ title: "", gestureEnabled: false }} />
+        <Stack.Screen name="ai-export" options={{ title: "" }} />
         <Stack.Screen name="bili-import" options={{ title: "" }} />
       </Stack>
       <Toast />

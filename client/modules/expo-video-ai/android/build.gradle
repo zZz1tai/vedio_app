@@ -1,0 +1,48 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.videoai'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.videoai"
+  ndkVersion "27.1.12297006"
+
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+    ndk {
+      abiFilters "arm64-v8a"
+    }
+    externalNativeBuild {
+      cmake {
+        cppFlags "-std=c++17"
+        arguments "-DANDROID_STL=c++_shared"
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "src/main/cpp/CMakeLists.txt"
+    }
+  }
+
+  sourceSets {
+    main {
+      jniLibs.srcDirs = ["src/main/jniLibs"]
+    }
+  }
+
+  packaging {
+    jniLibs {
+      pickFirsts += ["**/libc++_shared.so"]
+    }
+  }
+}
+
+dependencies {
+  implementation "androidx.work:work-runtime:2.9.1"
+}

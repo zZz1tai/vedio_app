@@ -11,6 +11,7 @@ import {
 import { FontAwesome6 } from '@expo/vector-icons';
 import * as NavigationBar from 'expo-navigation-bar';
 import * as Brightness from 'expo-brightness';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setStatusBarHidden } from 'expo-status-bar';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -23,6 +24,7 @@ import {
 } from '@/components/AppVideo';
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
+import { isVideoAiSupported } from '@/modules/expo-video-ai/src';
 import { formatDuration, getQualityLabel } from '@/utils/format';
 
 const SCALE_MODE_OPTIONS = [
@@ -116,6 +118,7 @@ export default function PlayerScreen() {
     height: number;
   } | null>(null);
   const [isPlayerLandscape, setIsPlayerLandscape] = useState(false);
+  const aiExportSupported = useMemo(() => isVideoAiSupported(), []);
 
   const playbackRates = useMemo(() => [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], []);
 
@@ -127,6 +130,15 @@ export default function PlayerScreen() {
     setPlaybackError(null);
     setEngineFallbackReason(null);
   }, [uri]);
+
+  // 离开播放页时恢复竖屏
+  useEffect(() => {
+    return () => {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(
+        () => undefined
+      );
+    };
+  }, []);
 
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -291,7 +303,17 @@ export default function PlayerScreen() {
   }, [startHideTimer]);
 
   const handleTogglePlayerOrientation = useCallback(() => {
-    setIsPlayerLandscape((previous) => !previous);
+    setIsPlayerLandscape((previous) => {
+      const next = !previous;
+      ScreenOrientation.lockAsync(
+        next
+          ? ScreenOrientation.OrientationLock.LANDSCAPE
+          : ScreenOrientation.OrientationLock.PORTRAIT_UP
+      ).catch((error) => {
+        console.warn('Unable to lock orientation:', error);
+      });
+      return next;
+    });
     resetVideoTransform();
     startHideTimer();
   }, [resetVideoTransform, startHideTimer]);
@@ -575,6 +597,18 @@ export default function PlayerScreen() {
     router.back();
   }, [router]);
 
+  const handleOpenAiExport = useCallback(() => {
+    if (!uri) return;
+    setIsPlaying(false);
+    router.push('/ai-export', {
+      inputUri: uri,
+      displayName: title || 'AI 导出视频',
+      durationMs: duration,
+      width: videoDimensions?.width,
+      height: videoDimensions?.height,
+    });
+  }, [duration, router, title, uri, videoDimensions?.height, videoDimensions?.width]);
+
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
   // Custom slider using PanResponder.
@@ -607,15 +641,6 @@ export default function PlayerScreen() {
   }, []);
 
   const hasVideoUri = typeof uri === 'string' && uri.trim().length > 0;
-  const rotatedVideoFrame =
-    isPlayerLandscape && containerSize.width > 0 && containerSize.height > 0
-      ? {
-          width: containerSize.height,
-          height: containerSize.width,
-          left: (containerSize.width - containerSize.height) / 2,
-          top: (containerSize.height - containerSize.width) / 2,
-        }
-      : undefined;
 
   if (!hasVideoUri) {
     return (
@@ -657,14 +682,11 @@ export default function PlayerScreen() {
           source={uri}
           style={[
             styles.video,
-            isPlayerLandscape && styles.videoLandscape,
-            rotatedVideoFrame,
             {
               transform: [
                 { translateX: videoOffset.x },
                 { translateY: videoOffset.y },
                 { scale: videoScale },
-                ...(isPlayerLandscape ? [{ rotate: '90deg' }] : []),
               ],
             },
           ]}
@@ -778,6 +800,15 @@ export default function PlayerScreen() {
               </View>
             )}
             <View style={styles.topRight}>
+              {aiExportSupported && (
+                <TouchableOpacity
+                  style={styles.controlButton}
+                  onPress={handleOpenAiExport}
+                  accessibilityLabel="AI 导出"
+                >
+                  <FontAwesome6 name="film" size={14} color="#FFFFFF" />
+                </TouchableOpacity>
+              )}
               {isMpvSupported && (
                 <TouchableOpacity
                   style={styles.scaleModeButton}
@@ -994,10 +1025,6 @@ const styles = StyleSheet.create({
   },
   video: {
     flex: 1,
-  },
-  videoLandscape: {
-    position: 'absolute',
-    flex: 0,
   },
   topOverlay: {
     position: 'absolute',

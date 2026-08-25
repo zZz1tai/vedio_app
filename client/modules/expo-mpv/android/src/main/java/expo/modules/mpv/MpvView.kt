@@ -158,6 +158,11 @@ class MpvView(context: Context, appContext: AppContext) : ExpoView(context, appC
         // observe_property 必须在 mpv core 初始化之后调用才会生效
         observeProperties()
         lib().addObserver(sharedObserver)
+        lib().addLogObserver(object : MPV.LogObserver {
+          override fun logMessage(prefix: String, level: Int, text: String) {
+            Log.d("mpv", "[$level] $prefix: $text")
+          }
+        })
         libInitialized = true
         Log.i(TAG, "libmpv initialized")
       } catch (t: Throwable) {
@@ -339,7 +344,10 @@ class MpvView(context: Context, appContext: AppContext) : ExpoView(context, appC
 
   private fun applyEnhancementInternal(level: String) = runCatching {
     val paths = shaderPathsFor(level)
-    lib().command(*arrayOf("change-list", "glsl-shaders", "set", paths.joinToString(";")))
+    // mpv 列表选项的分隔符是英文逗号，不能用分号（否则整个串被当成一个路径）
+    lib().command(*arrayOf("change-list", "glsl-shaders", "set", paths.joinToString(",")))
+    val applied = runCatching { lib().getPropertyString("glsl-shaders") }.getOrNull()
+    Log.i(TAG, "enhancement=$level glsl-shaders -> $applied")
   }
 
   // endregion
