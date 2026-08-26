@@ -13,6 +13,7 @@
 
 #include "gpu.h"
 #include "net.h"
+#include "cpu.h"
 #include "rife.h"
 
 namespace {
@@ -162,7 +163,7 @@ bool run_super_resolution(const ncnn::Mat& input, ncnn::Mat* output) {
 
       ncnn::Extractor extractor = g_super_resolution->create_extractor();
       extractor.set_light_mode(true);
-      if (extractor.input("input", tile) != 0) return false;
+      if (extractor.input("data", tile) != 0) return false;
       ncnn::Mat enhanced_tile;
       if (extractor.extract("output", enhanced_tile) != 0 || enhanced_tile.empty()) return false;
 
@@ -197,8 +198,8 @@ bool load_engine(const std::string& model_dir) {
     return false;
   }
 
-  const std::string sr_param = model_dir + "/realesrgan_x2plus.param";
-  const std::string sr_model = model_dir + "/realesrgan_x2plus.bin";
+  const std::string sr_param = model_dir + "/realesr-animevideov3-x2.param";
+  const std::string sr_model = model_dir + "/realesr-animevideov3-x2.bin";
   const std::string rife_param = model_dir + "/rife-v4.6/flownet.param";
   const std::string rife_model = model_dir + "/rife-v4.6/flownet.bin";
   if (!has_model_file(sr_param) || !has_model_file(sr_model) ||
@@ -224,7 +225,10 @@ bool load_engine(const std::string& model_dir) {
     return false;
   }
 
-  g_rife = std::make_unique<RIFE>(0, false, false, false, 1, false, true);
+  // RIFE v4.6's upstream custom Vulkan shaders target an older NCNN shader ABI.
+  // Keep Real-ESRGAN on Vulkan and use all big CPU cores for stable interpolation.
+  const int rife_threads = std::max(1, ncnn::get_big_cpu_count());
+  g_rife = std::make_unique<RIFE>(-1, false, false, false, rife_threads, false, true);
   if (g_rife->load(model_dir + "/rife-v4.6") != 0) {
     log_error("RIFE 模型加载失败");
     reset_engine();
@@ -283,9 +287,13 @@ Java_expo_modules_videoai_AiNativeEngine_nativeUpscale(JNIEnv* env, jobject, job
   int height = 0;
   if (!bitmap_to_rgb(env, bitmap, &rgb, &width, &height)) return nullptr;
   ncnn::Mat input = ncnn::Mat::from_pixels(rgb.data(), ncnn::Mat::PIXEL_RGB, width, height);
+  const float norm_vals[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
+  input.substract_mean_normalize(nullptr, norm_vals);
   ncnn::Mat output;
   if (!run_super_resolution(input, &output) || output.empty() || g_cancelled.load()) return nullptr;
 
+  const float denorm_vals[3] = {255.f, 255.f, 255.f};
+  output.substract_mean_normalize(nullptr, denorm_vals);
   std::vector<unsigned char> enhanced(static_cast<size_t>(output.w) * static_cast<size_t>(output.h) * 3);
   output.to_pixels(enhanced.data(), ncnn::Mat::PIXEL_RGB);
   return rgb_to_bitmap(env, enhanced.data(), output.w, output.h);
@@ -310,8 +318,19 @@ Java_expo_modules_videoai_AiNativeEngine_nativeInterpolate(JNIEnv* env, jobject,
 
   ncnn::Mat first_image(width, height, first_rgb.data(), static_cast<size_t>(3), 1);
   ncnn::Mat second_image(width, height, second_rgb.data(), static_cast<size_t>(3), 1);
-  ncnn::Mat output;
-  if (g_rife->process(first_image, second_image, 0.5f, output) != 0 || output.empty() || g_cancelled.load()) {
+
+  // RIFE's CPU path serializes the final RGB image directly into outimage.data.
+  // It does not allocate outimage itself, so an empty Mat makes ncnn::Mat::to_pixels()
+  // write through a null pointer. This was exposed by the super-resolution +
+  // interpolation pipeline as a native SIGSEGV.
+  ncnn::Mat output(width, height, 3, static_cast<size_t>(1));
+  if (output.empty()) {
+    log_error("无法分配 RIFE 输出缓冲区");
+    return nullptr;
+  }
+  if (g_rife->process(first_image, second_image, 0.5f, output) != 0 ||
+      output.empty() || output.w != width || output.h != height || g_cancelled.load()) {
+    log_error("RIFE 插帧推理失败");
     return nullptr;
   }
   return rgb_to_bitmap(env, static_cast<const unsigned char*>(output.data), output.w, output.h);

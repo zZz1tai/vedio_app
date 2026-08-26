@@ -6,18 +6,28 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
-import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.media.MediaScannerConnection
 import android.net.Uri
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
+import android.opengl.GLES20
+import android.opengl.GLUtils
 import android.os.Environment
 import android.os.Build
 import android.provider.MediaStore
+import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -41,9 +51,6 @@ internal class AiVideoExportPipeline(private val context: Context) {
     val probe = probe(request.inputUri)
     require(probe.width > 0 && probe.height > 0) { "无法读取视频分辨率" }
     require(probe.durationUs > 0) { "无法读取视频时长" }
-    require(probe.width * probe.height <= MAX_INPUT_PIXELS) {
-      "首版 AI 导出仅支持 720p 及以下输入视频"
-    }
     require(probe.durationUs <= MAX_DURATION_US) {
       "首版 AI 导出仅支持 60 秒以内的视频"
     }
@@ -292,10 +299,9 @@ internal class AiVideoExportPipeline(private val context: Context) {
   private data class VideoProbe(val width: Int, val height: Int, val durationUs: Long, val fps: Double)
 
   companion object {
-    private const val MAX_INPUT_PIXELS = 1280 * 720
     private const val MAX_DURATION_US = 60_000_000L
-    private const val MAX_OUTPUT_WIDTH = 2560
-    private const val MAX_OUTPUT_HEIGHT = 1440
+    private const val MAX_OUTPUT_WIDTH = 3840
+    private const val MAX_OUTPUT_HEIGHT = 2160
 
     internal fun setExtractorSource(extractor: MediaExtractor, context: Context, inputUri: String) {
       val uri = Uri.parse(inputUri)
@@ -330,12 +336,11 @@ private class H264Mp4Encoder(
   private val fps: Double,
   private val preset: String
 ) {
-  private val codecInfo = findEncoder()
-  private val colorFormat = chooseColorFormat(codecInfo)
-  private val encoder = MediaCodec.createByCodecName(codecInfo.name)
+  private val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
   private val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
   private val bufferInfo = MediaCodec.BufferInfo()
   private val audioSource = AudioTrackSource(context, inputUri)
+  private lateinit var inputSurface: EncoderInputSurface
   private var videoTrack = -1
   private var audioTrack = -1
   private var muxerStarted = false
@@ -343,7 +348,7 @@ private class H264Mp4Encoder(
 
   init {
     val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-      setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
+      setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
       val qualityMultiplier = if (preset == "quality") 1.45 else 1.0
       setInteger(
         MediaFormat.KEY_BIT_RATE,
@@ -353,31 +358,22 @@ private class H264Mp4Encoder(
       setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
     }
     encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    inputSurface = EncoderInputSurface(encoder.createInputSurface(), width, height)
     encoder.start()
   }
 
   fun writeFrame(bitmap: Bitmap, presentationTimeUs: Long) {
     check(!finished) { "编码器已经结束" }
-    var inputIndex = encoder.dequeueInputBuffer(TIMEOUT_US)
-    while (inputIndex < 0) {
-      drainEncoder(false)
-      inputIndex = encoder.dequeueInputBuffer(TIMEOUT_US)
-    }
-    val input = encoder.getInputBuffer(inputIndex) ?: throw IllegalStateException("无法获取编码输入缓冲区")
-    input.clear()
-    fillYuvBuffer(bitmap, input)
-    encoder.queueInputBuffer(inputIndex, 0, width * height * 3 / 2, presentationTimeUs, 0)
+    inputSurface.drawFrame(bitmap)
+    inputSurface.setPresentationTime(presentationTimeUs * 1_000L)
+    inputSurface.swapBuffers()
     drainEncoder(false)
   }
 
   fun finish(shouldCancel: () -> Boolean) {
     if (finished) return
-    var inputIndex = encoder.dequeueInputBuffer(TIMEOUT_US)
-    while (inputIndex < 0) {
-      drainEncoder(false)
-      inputIndex = encoder.dequeueInputBuffer(TIMEOUT_US)
-    }
-    encoder.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+    inputSurface.makeCurrent()
+    encoder.signalEndOfInputStream()
     drainEncoder(true)
     if (shouldCancel()) throw AiVideoExportCancelledException()
     if (muxerStarted && audioTrack >= 0) audioSource.copyInto(muxer, audioTrack, shouldCancel)
@@ -421,86 +417,203 @@ private class H264Mp4Encoder(
     }
   }
 
-  private fun fillYuvBuffer(bitmap: Bitmap, output: ByteBuffer) {
-    require(bitmap.width == width && bitmap.height == height) { "AI 输出帧尺寸不匹配" }
-    val pixels = IntArray(width * height)
-    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-    for (pixel in pixels) output.put(luma(pixel).toByte())
-    if (colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) {
-      for (component in 0..1) {
-        for (y in 0 until height step 2) {
-          for (x in 0 until width step 2) {
-            val chroma = chroma(pixels, x, y)
-            output.put(if (component == 0) chroma.first.toByte() else chroma.second.toByte())
-          }
-        }
-      }
-    } else {
-      for (y in 0 until height step 2) {
-        for (x in 0 until width step 2) {
-          val chroma = chroma(pixels, x, y)
-          output.put(chroma.first.toByte())
-          output.put(chroma.second.toByte())
-        }
-      }
-    }
-  }
-
-  private fun luma(color: Int): Int =
-    ((66 * Color.red(color) + 129 * Color.green(color) + 25 * Color.blue(color) + 128) shr 8) + 16
-
-  private fun chroma(pixels: IntArray, x: Int, y: Int): Pair<Int, Int> {
-    var red = 0
-    var green = 0
-    var blue = 0
-    for (offsetY in 0..1) {
-      for (offsetX in 0..1) {
-        val color = pixels[(y + offsetY) * width + x + offsetX]
-        red += Color.red(color)
-        green += Color.green(color)
-        blue += Color.blue(color)
-      }
-    }
-    red /= 4
-    green /= 4
-    blue /= 4
-    val u = (((-38 * red - 74 * green + 112 * blue + 128) shr 8) + 128).coerceIn(0, 255)
-    val v = (((112 * red - 94 * green - 18 * blue + 128) shr 8) + 128).coerceIn(0, 255)
-    return u to v
-  }
-
   private fun release() {
     runCatching { audioSource.close() }
+    runCatching { inputSurface.release() }
     runCatching { encoder.stop() }
     runCatching { encoder.release() }
     if (muxerStarted) runCatching { muxer.stop() }
     runCatching { muxer.release() }
   }
 
-  private fun findEncoder(): MediaCodecInfo {
-    val codecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
-    return codecs.firstOrNull { info ->
-      info.isEncoder && MediaFormat.MIMETYPE_VIDEO_AVC in info.supportedTypes && runCatching {
-        chooseColorFormat(info) != -1
-      }.getOrDefault(false)
-    } ?: throw IllegalStateException("设备不支持兼容的 H.264 编码器")
-  }
-
-  private fun chooseColorFormat(info: MediaCodecInfo): Int {
-    val formats = info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).colorFormats
-    return when {
-      formats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) ->
-        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
-      formats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) ->
-        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
-      else -> -1
-    }
-  }
-
   companion object {
     private const val TIMEOUT_US = 10_000L
   }
 }
+
+private class EncoderInputSurface(
+  private val surface: Surface,
+  private val width: Int,
+  private val height: Int
+) {
+  private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
+  private var context: EGLContext = EGL14.EGL_NO_CONTEXT
+  private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+  private lateinit var renderer: BitmapFrameRenderer
+
+  init {
+    display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+    check(display != EGL14.EGL_NO_DISPLAY) { "无法获取 EGL display" }
+    val version = IntArray(2)
+    check(EGL14.eglInitialize(display, version, 0, version, 1)) { "无法初始化 EGL" }
+
+    val attributes = intArrayOf(
+      EGL14.EGL_RED_SIZE, 8,
+      EGL14.EGL_GREEN_SIZE, 8,
+      EGL14.EGL_BLUE_SIZE, 8,
+      EGL14.EGL_ALPHA_SIZE, 8,
+      EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+      EGL_RECORDABLE_ANDROID, 1,
+      EGL14.EGL_NONE
+    )
+    val configs = arrayOfNulls<EGLConfig>(1)
+    val configCount = IntArray(1)
+    check(EGL14.eglChooseConfig(display, attributes, 0, configs, 0, configs.size, configCount, 0)) {
+      "无法选择 EGL config"
+    }
+    val config = configs[0] ?: throw IllegalStateException("没有可用的 EGL config")
+    context = EGL14.eglCreateContext(
+      display,
+      config,
+      EGL14.EGL_NO_CONTEXT,
+      intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+      0
+    )
+    checkEgl("创建 EGL context")
+    eglSurface = EGL14.eglCreateWindowSurface(display, config, surface, intArrayOf(EGL14.EGL_NONE), 0)
+    checkEgl("创建编码 EGL surface")
+    makeCurrent()
+    renderer = BitmapFrameRenderer()
+  }
+
+  fun makeCurrent() {
+    check(EGL14.eglMakeCurrent(display, eglSurface, eglSurface, context)) { "无法激活编码 EGL surface" }
+  }
+
+  fun drawFrame(bitmap: Bitmap) {
+    require(bitmap.width == width && bitmap.height == height) { "AI 输出帧尺寸不匹配" }
+    makeCurrent()
+    renderer.draw(bitmap, width, height)
+  }
+
+  fun setPresentationTime(presentationTimeNs: Long) {
+    EGLExt.eglPresentationTimeANDROID(display, eglSurface, presentationTimeNs)
+  }
+
+  fun swapBuffers() {
+    check(EGL14.eglSwapBuffers(display, eglSurface)) { "编码帧提交失败" }
+  }
+
+  fun release() {
+    if (::renderer.isInitialized) renderer.release()
+    if (display != EGL14.EGL_NO_DISPLAY) {
+      EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+      if (eglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, eglSurface)
+      if (context != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(display, context)
+      EGL14.eglReleaseThread()
+      EGL14.eglTerminate(display)
+    }
+    surface.release()
+    display = EGL14.EGL_NO_DISPLAY
+    context = EGL14.EGL_NO_CONTEXT
+    eglSurface = EGL14.EGL_NO_SURFACE
+  }
+
+  private fun checkEgl(action: String) {
+    check(EGL14.eglGetError() == EGL14.EGL_SUCCESS) { "$action 失败" }
+  }
+
+  companion object {
+    private const val EGL_RECORDABLE_ANDROID = 0x3142
+  }
+}
+
+private class BitmapFrameRenderer {
+  private val vertexBuffer = floatBuffer(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
+  private val textureBuffer = floatBuffer(floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f))
+  private val program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+  private val positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
+  private val textureHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
+  private val samplerHandle = GLES20.glGetUniformLocation(program, "uTexture")
+  private val textureId = IntArray(1)
+
+  init {
+    GLES20.glGenTextures(1, textureId, 0)
+    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId[0])
+    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+  }
+
+  fun draw(bitmap: Bitmap, width: Int, height: Int) {
+    GLES20.glViewport(0, 0, width, height)
+    GLES20.glClearColor(0f, 0f, 0f, 1f)
+    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+    GLES20.glUseProgram(program)
+    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId[0])
+    GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+    GLES20.glUniform1i(samplerHandle, 0)
+
+    vertexBuffer.position(0)
+    textureBuffer.position(0)
+    GLES20.glEnableVertexAttribArray(positionHandle)
+    GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
+    GLES20.glEnableVertexAttribArray(textureHandle)
+    GLES20.glVertexAttribPointer(textureHandle, 2, GLES20.GL_FLOAT, false, 0, textureBuffer)
+    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    GLES20.glDisableVertexAttribArray(positionHandle)
+    GLES20.glDisableVertexAttribArray(textureHandle)
+  }
+
+  fun release() {
+    GLES20.glDeleteTextures(1, textureId, 0)
+    GLES20.glDeleteProgram(program)
+  }
+
+  private fun createProgram(vertexSource: String, fragmentSource: String): Int {
+    val vertex = compileShader(GLES20.GL_VERTEX_SHADER, vertexSource)
+    val fragment = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource)
+    return GLES20.glCreateProgram().also { program ->
+      GLES20.glAttachShader(program, vertex)
+      GLES20.glAttachShader(program, fragment)
+      GLES20.glLinkProgram(program)
+      val linkStatus = IntArray(1)
+      GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+      check(linkStatus[0] == GLES20.GL_TRUE) { "无法链接编码着色器" }
+      GLES20.glDeleteShader(vertex)
+      GLES20.glDeleteShader(fragment)
+    }
+  }
+
+  private fun compileShader(type: Int, source: String): Int = GLES20.glCreateShader(type).also { shader ->
+    GLES20.glShaderSource(shader, source)
+    GLES20.glCompileShader(shader)
+    val compiled = IntArray(1)
+    GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+    check(compiled[0] == GLES20.GL_TRUE) { "无法编译编码着色器" }
+  }
+
+  companion object {
+    private const val VERTEX_SHADER = """
+      attribute vec4 aPosition;
+      attribute vec2 aTexCoord;
+      varying vec2 vTexCoord;
+      void main() {
+        gl_Position = aPosition;
+        vTexCoord = aTexCoord;
+      }
+    """
+    private const val FRAGMENT_SHADER = """
+      precision mediump float;
+      varying vec2 vTexCoord;
+      uniform sampler2D uTexture;
+      void main() {
+        gl_FragColor = texture2D(uTexture, vTexCoord);
+      }
+    """
+  }
+}
+
+private fun floatBuffer(values: FloatArray): FloatBuffer =
+  ByteBuffer.allocateDirect(values.size * Float.SIZE_BYTES)
+    .order(ByteOrder.nativeOrder())
+    .asFloatBuffer()
+    .apply {
+      put(values)
+      position(0)
+    }
 
 private class AudioTrackSource(context: Context, inputUri: String) {
   private val extractor = MediaExtractor()
