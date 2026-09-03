@@ -32,6 +32,7 @@
     "expo-application": "~7.0.8",
     "expo-auth-session": "~7.0.10",
     "expo-av": "~16.0.8",
+    "expo-mpv": "file:modules/expo-mpv",
     "expo-blur": "~15.0.8",
     "expo-brightness": "~14.0.8",
     "expo-camera": "~17.0.10",

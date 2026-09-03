@@ -12,7 +12,7 @@
  *   initialNumToRender / maxToRenderPerBatch 随列数放大，windowSize 提到 11
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { FlatList, Image, TouchableOpacity } from 'react-native';
+import { FlatList, Image, TouchableOpacity, View } from 'react-native';
 import { GestureDetector, type GestureType } from 'react-native-gesture-handler';
 import { GRID_GAP, screenWidth, PhotoItem } from './shared';
 import { getThumbnailSync, subscribeThumbnails } from '@/utils/thumbnailCache';
@@ -22,22 +22,29 @@ type Styles = ReturnType<typeof createStyles>;
 
 const PAGE_SIZE = 300;
 
-/** 缩略图单元格：命中缓存直接显示小图；未命中先显示原图，native 生成后自动切换 */
+/**
+ * 缩略图单元格：命中缓存直接显示小图；
+ * 未命中时显示浅色占位并订阅事件，native 生成后自动替换——
+ * 绝不回退加载原图（列表全尺寸解码原图是多列卡顿/点击卡顿的根因）。
+ */
 function ThumbImage({ sourceUri, style }: { sourceUri: string; style: number | object }) {
-  const [uri, setUri] = useState<string>(() => getThumbnailSync(sourceUri) ?? sourceUri);
+  const [thumbUri, setThumbUri] = useState<string | null>(() => getThumbnailSync(sourceUri));
 
   useEffect(() => {
     // sourceUri 变化（cell 复用）时重新解析
     const cached = getThumbnailSync(sourceUri);
-    setUri(cached ?? sourceUri);
+    setThumbUri(cached);
     if (cached) return;
     const unsubscribe = subscribeThumbnails((changedUri, thumbUri) => {
-      if (changedUri === sourceUri) setUri(thumbUri);
+      if (changedUri === sourceUri) setThumbUri(thumbUri);
     });
     return unsubscribe;
   }, [sourceUri]);
 
-  return <Image source={{ uri }} style={style} resizeMode="cover" resizeMethod="resize" />;
+  if (!thumbUri) {
+    return <View style={[style, { backgroundColor: 'rgba(148,163,184,0.12)' }]} />;
+  }
+  return <Image source={{ uri: thumbUri }} style={style} resizeMode="cover" resizeMethod="resize" />;
 }
 
 interface PhotoGridProps {

@@ -199,8 +199,9 @@ export function useHomeMedia() {
       }
 
       setPhotos(photoItems);
-      // 扫描完成：后台预热缩略图（native 串行解码，已缓存的自动跳过，越用越顺）
-      prepareThumbnails(photoItems.map((item) => item.uri));
+      // 只预热渐进窗口附近的前 600 张：全量预热 2 万张会让可见区排在长队列尾、
+      // 灰块迟迟不填充；滚动深处的 cell 会各自懒触发生成
+      prepareThumbnails(photoItems.slice(0, 600).map((item) => item.uri));
     } catch (error) {
       console.error('Failed to load photos:', error);
     } finally {

@@ -38,12 +38,12 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
     // 长任务据此静默退出——绝不回调已销毁的 bridge（回调会触发 RN C++ FATAL abort）
     @Volatile private var destroyed = false
 
-    // 扫描与缩略图各自单线程串行执行：IO/解码完全不占 JS 线程，也不互相阻塞；
-    // daemon 线程不阻止进程退出
+    // 扫描单线程串行（避免并发遍历抢占 IO 预算）；缩略图解码 2 并发（thumbInProgress 去重保证不重复解码），
+    // 预热吞吐翻倍、未命中占位更快被填充；全部 daemon，不阻止进程退出
     private val scanExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "StorageAccess-scan").apply { isDaemon = true }
     }
-    private val thumbExecutor = Executors.newSingleThreadExecutor { r ->
+    private val thumbExecutor = Executors.newFixedThreadPool(2) { r ->
         Thread(r, "StorageAccess-thumb").apply { isDaemon = true }
     }
     private val thumbFailedUris = ConcurrentSkipListSet<String>()

@@ -449,20 +449,63 @@ function ZoomableImage({
     [clampPan, cur, panX, panY, zoom]
   );
 
-  // 以屏幕焦点为中心缩放：保持焦点处的图像内容视觉上不动
-  // 推导：屏幕位置 P = center + pan + C·S，保持 P 不变时 pan' = f − (f − pan)·(S'/S)
-  const zoomAt = useCallback(
+  /** 停掉进行中的动画（复位/双击动画互相打断时的竞态根源） */
+  const stopAnim = useCallback(() => {
+    zoom.stopAnimation();
+    panX.stopAnimation();
+    panY.stopAnimation();
+  }, [panX, panY, zoom]);
+
+  /**
+   * 以动画过渡到目标变换（双击放大/复位统一走这里）。
+   * 之前双击直接 setValue 瞬跳 + 与 spring 复位竞争 → 画面闪跳。
+   */
+  const animateTo = useCallback(
+    (scale: number, x: number, y: number) => {
+      const clamped = clampPan(scale, x, y);
+      stopAnim();
+      Animated.parallel([
+        Animated.timing(zoom, { toValue: scale, duration: 220, useNativeDriver: true }),
+        Animated.timing(panX, { toValue: clamped.x, duration: 220, useNativeDriver: true }),
+        Animated.timing(panY, { toValue: clamped.y, duration: 220, useNativeDriver: true }),
+      ]).start();
+      cur.scale = scale;
+      cur.x = clamped.x;
+      cur.y = clamped.y;
+    },
+    [clampPan, cur, panX, panY, stopAnim, zoom]
+  );
+
+  /**
+   * 计算以屏幕焦点为中心的缩放目标（不落地，供动画使用）。
+   * 推导：屏幕位置 P = center + pan + C·S，保持 P 不变时 pan' = f − (f − pan)·(S'/S)
+   */
+  const computeZoomTarget = useCallback(
     (nextScale: number, focusX: number, focusY: number) => {
       const s = Math.max(1, Math.min(MAX_ZOOM, nextScale));
       const fx = focusX - layout.w / 2;
       const fy = focusY - layout.h / 2;
       const ratio = s / (base.scale || 1);
-      apply(s, fx - (fx - base.x) * ratio, fy - (fy - base.y) * ratio);
+      return {
+        scale: s,
+        x: fx - (fx - base.x) * ratio,
+        y: fy - (fy - base.y) * ratio,
+      };
     },
-    [apply, base, layout.h, layout.w]
+    [base, layout.h, layout.w]
+  );
+
+  // 捏合跟手：目标即时落地（不能有动画延迟）
+  const zoomAt = useCallback(
+    (nextScale: number, focusX: number, focusY: number) => {
+      const target = computeZoomTarget(nextScale, focusX, focusY);
+      apply(target.scale, target.x, target.y);
+    },
+    [apply, computeZoomTarget]
   );
 
   const reset = useCallback(() => {
+    stopAnim();
     Animated.parallel([
       Animated.spring(zoom, { toValue: 1, useNativeDriver: true, friction: 7 }),
       Animated.spring(panX, { toValue: 0, useNativeDriver: true, friction: 7 }),
@@ -471,7 +514,7 @@ function ZoomableImage({
     cur.scale = 1;
     cur.x = 0;
     cur.y = 0;
-  }, [cur, panX, panY, zoom]);
+  }, [cur, panX, panY, stopAnim, zoom]);
 
   const pinch = useMemo(
     () =>
@@ -522,9 +565,11 @@ function ZoomableImage({
           base.scale = cur.scale;
           base.x = cur.x;
           base.y = cur.y;
-          zoomAt(DOUBLE_TAP_ZOOM, event.x, event.y);
+          // 动画放大而非瞬跳：消除双击时画面闪跳
+          const target = computeZoomTarget(DOUBLE_TAP_ZOOM, event.x, event.y);
+          animateTo(target.scale, target.x, target.y);
         }),
-    [base, cur, reset, zoomAt]
+    [animateTo, base, computeZoomTarget, cur, reset]
   );
 
   const gesture = useMemo(
