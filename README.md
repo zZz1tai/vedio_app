@@ -63,7 +63,7 @@ AI 是逐帧计算的,一分钟的视频可能要跑几十分钟,和手机性能
 
 ## 给开发者
 
-本仓库为 monorepo 结构:client(Expo 应用)+ server(Express 服务)。
+应用本体在 `client` 目录（Expo / React Native + Android 原生模块，AI 推理在 `client/modules/expo-video-ai`）。仓库根部的 `server/` 是脚手架模板遗留的 Express 空壳，与 App 运行无关。
 
 ```bash
 cd client && npm install
