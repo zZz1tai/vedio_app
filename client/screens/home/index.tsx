@@ -16,6 +16,7 @@ import { Screen } from '@/components/Screen';
 import { useSafeRouter } from '@/hooks/useSafeRouter';
 import { useHomeMedia } from '@/hooks/useHomeMedia';
 import { usePhotoGridColumns } from '@/hooks/usePhotoGridColumns';
+import { GlowBackground } from '@/components/glass';
 import { useCSSVariable } from 'uniwind';
 import { useThemePreference } from '@/contexts/ThemeContext';
 
@@ -34,7 +35,6 @@ import {
   resolveDateBucket,
   DATE_BUCKET_ORDER,
   ThemePalette,
-  THEME_CYCLE_ORDER,
 } from './shared';
 import { createStyles } from './styles';
 import { VideoCard } from './VideoCard';
@@ -44,7 +44,7 @@ import { RenameDialog } from './RenameDialog';
 export default function HomeScreen() {
   const router = useSafeRouter();
   const insets = useSafeAreaInsets();
-  const { preference, setPreference: setThemePreference } = useThemePreference();
+  const { preference } = useThemePreference();
   const [
     background,
     foreground,
@@ -100,12 +100,6 @@ export default function HomeScreen() {
   ]);
 
   const statusBarStyle = preference === 'light' ? 'dark' : 'light';
-
-  const handleCycleTheme = useCallback(() => {
-    const next =
-      THEME_CYCLE_ORDER[(THEME_CYCLE_ORDER.indexOf(preference) + 1) % THEME_CYCLE_ORDER.length];
-    setThemePreference(next);
-  }, [preference, setThemePreference]);
 
   // 数据层：权限、视频/图片加载与分页、全盘扫描合并、重命名（原 index 内联逻辑）
   const {
@@ -322,6 +316,8 @@ export default function HomeScreen() {
 
   return (
     <Screen backgroundColor={c.background} statusBarStyle={statusBarStyle} safeAreaEdges={['left', 'right']}>
+      {/* 液态玻璃光环境：三色柔光光斑缓慢流动 */}
+      <GlowBackground colors={[c.accent, '#22D3EE', '#A78BFA']} opacity={0.3} />
       <View style={[styles.header, { paddingTop: Platform.OS === 'web' ? 20 : insets.top + 12 }]}>
         <View style={styles.headerLeft}>
           <Text style={styles.headerTitle}>视频播放器</Text>
@@ -346,19 +342,10 @@ export default function HomeScreen() {
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.viewToggle}
-                onPress={handleCycleTheme}
+                onPress={() => router.push('/settings')}
+                accessibilityLabel="设置"
               >
-                <FontAwesome6
-                  name={
-                    preference === 'system'
-                      ? 'circle-half-stroke'
-                      : preference === 'light'
-                        ? 'sun'
-                        : 'moon'
-                  }
-                  size={15}
-                  color={muted}
-                />
+                <FontAwesome6 name="gear" size={15} color={muted} />
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.viewToggle, grouped && styles.viewToggleActive]}
@@ -385,19 +372,10 @@ export default function HomeScreen() {
           {activeTab === 'photo' && (
             <TouchableOpacity
               style={styles.viewToggle}
-              onPress={handleCycleTheme}
+              onPress={() => router.push('/settings')}
+              accessibilityLabel="设置"
             >
-              <FontAwesome6
-                name={
-                  preference === 'system'
-                    ? 'circle-half-stroke'
-                    : preference === 'light'
-                      ? 'sun'
-                      : 'moon'
-                }
-                size={15}
-                color={muted}
-              />
+              <FontAwesome6 name="gear" size={15} color={muted} />
             </TouchableOpacity>
           )}
         </View>

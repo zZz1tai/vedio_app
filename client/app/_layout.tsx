@@ -27,6 +27,7 @@ export default function RootLayout() {
         <Stack.Screen name="ai-export" options={{ title: "" }} />
         <Stack.Screen name="image-upscale" options={{ title: "" }} />
         <Stack.Screen name="bili-import" options={{ title: "" }} />
+        <Stack.Screen name="settings" options={{ title: "" }} />
       </Stack>
       <Toast />
     </Provider>

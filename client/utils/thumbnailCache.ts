@@ -9,6 +9,7 @@
  */
 import { DeviceEventEmitter } from 'react-native';
 import { NativeModules } from 'react-native';
+import { Directory, File, Paths } from 'expo-file-system';
 
 const NativeStorageAccess = NativeModules.StorageAccess as
   | {
@@ -18,6 +19,7 @@ const NativeStorageAccess = NativeModules.StorageAccess as
   | undefined;
 
 const DEFAULT_THUMB_SIZE = 512;
+const THUMB_DIR = 'media_thumbs';
 
 // 内存级缓存：sourceUri -> thumbUri
 const memoryCache = new Map<string, string>();
@@ -75,5 +77,32 @@ export function prepareThumbnails(sources: string[], targetSize = DEFAULT_THUMB_
     NativeStorageAccess?.prepareThumbnails?.(sources, targetSize)?.catch?.(() => undefined);
   } catch {
     // 预热失败无感
+  }
+}
+
+/** 查询缩略图磁盘缓存总大小（字节） */
+export function getThumbnailCacheSize(): number {
+  try {
+    const dir = new Directory(Paths.cache, THUMB_DIR);
+    if (!dir.exists) return 0;
+    let total = 0;
+    for (const entry of dir.list()) {
+      if (entry instanceof File) total += entry.size ?? 0;
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+
+/** 清空缩略图磁盘缓存与内存缓存 */
+export function clearThumbnailCache(): boolean {
+  try {
+    const dir = new Directory(Paths.cache, THUMB_DIR);
+    if (dir.exists) dir.delete();
+    memoryCache.clear();
+    return true;
+  } catch {
+    return false;
   }
 }

@@ -17,6 +17,7 @@ import Toast from 'react-native-toast-message';
 import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useNavigation } from 'expo-router';
 import { Screen } from '@/components/Screen';
+import { GlowBackground } from '@/components/glass';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import {
   isVideoAiSupported,
@@ -131,6 +132,8 @@ export default function ImageUpscaleScreen() {
 
   return (
     <Screen backgroundColor="#0A0A0F" statusBarStyle="light" safeAreaEdges={['top', 'left', 'right', 'bottom']}>
+      {/* 液态玻璃光环境 */}
+      <GlowBackground colors={['#4F46E5', '#22D3EE', '#A78BFA']} opacity={0.3} />
       <View style={styles.header}>
         <TouchableOpacity
           style={styles.iconButton}
@@ -558,7 +561,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#27272F',
+    borderBottomColor: 'rgba(255,255,255,0.12)',
   },
   iconButton: {
     width: 38,
@@ -666,9 +669,12 @@ const styles = StyleSheet.create({
   preview: {
     height: 320,
     borderRadius: 12,
-    backgroundColor: '#14141C',
+    backgroundColor: 'rgba(255,255,255,0.06)',
     borderWidth: 1,
-    borderColor: '#27272F',
+    borderTopColor: 'rgba(255,255,255,0.3)',
+    borderLeftColor: 'rgba(255,255,255,0.16)',
+    borderRightColor: 'rgba(255,255,255,0.08)',
+    borderBottomColor: 'rgba(255,255,255,0.05)',
     overflow: 'hidden',
     alignItems: 'center',
     justifyContent: 'center',
@@ -741,7 +747,7 @@ const styles = StyleSheet.create({
     height: 30,
     padding: 2,
     borderRadius: 6,
-    backgroundColor: '#1A1A22',
+    backgroundColor: 'rgba(255,255,255,0.06)',
     gap: 2,
   },
   compareItem: {
@@ -767,7 +773,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 16,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#27272F',
+    borderBottomColor: 'rgba(255,255,255,0.12)',
   },
   fileIcon: {
     width: 38,
@@ -800,7 +806,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#27272F',
+    borderBottomColor: 'rgba(255,255,255,0.12)',
   },
   settingLabel: {
     color: '#CBD5E1',
@@ -812,7 +818,7 @@ const styles = StyleSheet.create({
     height: 40,
     padding: 2,
     borderRadius: 8,
-    backgroundColor: '#1A1A22',
+    backgroundColor: 'rgba(255,255,255,0.06)',
     gap: 2,
   },
   segment: {
@@ -901,6 +907,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 9,
     backgroundColor: '#4F46E5',
+    borderWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.42)',
+    borderLeftColor: 'rgba(255,255,255,0.2)',
+    borderBottomColor: 'rgba(255,255,255,0.08)',
     borderRadius: 6,
   },
   startButtonDisabled: {

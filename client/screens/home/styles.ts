@@ -1,11 +1,48 @@
 /**
  * 首页样式表（从 home/index.tsx 拆出，纯机械搬运，行为不变）
+ * v2.0.0：容器统一液态玻璃化（半透明底 + 四边独立边框色折射高光）
  */
 import { StyleSheet } from 'react-native';
 import { CARD_WIDTH, GRID_GAP } from './shared';
 import type { ThemePalette } from './shared';
 
+/** 估算背景明度：决定玻璃容器用浅色系（亮主题）还是深色系（暗主题） */
+function isLightBg(hex: string): boolean {
+  const h = (hex || '').replace('#', '');
+  if (h.length < 6) return false;
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return false;
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.5;
+}
+
 export function createStyles(c: ThemePalette) {
+  const light = isLightBg(c.background);
+
+  /** 液态玻璃边框：四边独立色，顶部亮边、侧面次亮、底右暗边（折射感） */
+  const glassBorder = {
+    borderWidth: 1,
+    borderTopColor: light ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.32)',
+    borderLeftColor: light ? 'rgba(255,255,255,0.72)' : 'rgba(255,255,255,0.16)',
+    borderRightColor: light ? 'rgba(255,255,255,0.52)' : 'rgba(255,255,255,0.08)',
+    borderBottomColor: light ? 'rgba(255,255,255,0.36)' : 'rgba(255,255,255,0.05)',
+  } as const;
+
+  /** 液态玻璃容器：半透明底 + 玻璃边框 */
+  const glass = (alpha: number) => ({
+    ...glassBorder,
+    backgroundColor: light
+      ? `rgba(255, 255, 255, ${alpha})`
+      : `rgba(255, 255, 255, ${alpha * 0.22})`,
+  });
+
+  /** 激活态（accent）容器的顶部高光边 */
+  const accentGlass = {
+    borderTopColor: 'rgba(255,255,255,0.45)',
+    borderLeftColor: 'rgba(255,255,255,0.22)',
+  } as const;
+
   return StyleSheet.create({
   centerContainer: {
     flex: 1,
@@ -78,15 +115,14 @@ export function createStyles(c: ThemePalette) {
     width: 40,
     height: 40,
     borderRadius: 10,
-    backgroundColor: c.surface,
+    ...glass(0.62),
     justifyContent: 'center',
     alignItems: 'center',
-    borderWidth: 1,
-    borderColor: c.border,
   },
   viewToggleActive: {
     backgroundColor: c.accent,
     borderColor: c.accent,
+    ...accentGlass,
   },
   headerActions: {
     flexDirection: 'row',
@@ -103,9 +139,7 @@ export function createStyles(c: ThemePalette) {
     flex: 1,
     height: 38,
     borderRadius: 10,
-    backgroundColor: c.surface,
-    borderWidth: 1,
-    borderColor: c.border,
+    ...glass(0.62),
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -114,6 +148,7 @@ export function createStyles(c: ThemePalette) {
   homeTabActive: {
     backgroundColor: c.accent,
     borderColor: c.accent,
+    ...accentGlass,
   },
   homeTabText: {
     color: c.muted,
@@ -134,8 +169,7 @@ export function createStyles(c: ThemePalette) {
     backgroundColor: c.backgroundTertiary,
     borderRadius: 10,
     overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: c.border,
+    ...glassBorder,
     position: 'relative',
   },
   photoImage: {
@@ -151,14 +185,13 @@ export function createStyles(c: ThemePalette) {
     height: 30,
     paddingHorizontal: 14,
     borderRadius: 15,
-    backgroundColor: c.surface,
-    borderWidth: 1,
-    borderColor: c.border,
+    ...glass(0.62),
     justifyContent: 'center',
   },
   groupTabActive: {
     backgroundColor: c.accent,
     borderColor: c.accent,
+    ...accentGlass,
   },
   groupTabText: {
     color: c.muted,
@@ -224,11 +257,9 @@ export function createStyles(c: ThemePalette) {
     width: CARD_WIDTH,
     marginHorizontal: GRID_GAP / 2,
     marginBottom: GRID_GAP,
-    backgroundColor: c.surface,
+    ...glass(0.62),
     borderRadius: 12,
     overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: c.border,
   },
   gridThumbnail: {
     width: '100%',
@@ -360,10 +391,8 @@ export function createStyles(c: ThemePalette) {
     marginBottom: 12,
     height: 40,
     paddingHorizontal: 12,
-    backgroundColor: c.surface,
+    ...glass(0.62),
     borderRadius: 10,
-    borderWidth: 1,
-    borderColor: c.border,
   },
   searchInput: {
     flex: 1,
@@ -398,15 +427,14 @@ export function createStyles(c: ThemePalette) {
     height: 30,
     paddingHorizontal: 8,
     borderRadius: 15,
-    backgroundColor: c.surface,
-    borderWidth: 1,
-    borderColor: c.border,
+    ...glass(0.62),
     alignItems: 'center',
     justifyContent: 'center',
   },
   gridPickerItemActive: {
     backgroundColor: c.accent,
     borderColor: c.accent,
+    ...accentGlass,
   },
   gridPickerText: {
     color: c.muted,
@@ -454,7 +482,10 @@ export function createStyles(c: ThemePalette) {
     backgroundColor: c.dangerSoft,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: 'rgba(252,165,165,0.2)',
+    borderTopColor: light ? 'rgba(255,255,255,0.9)' : 'rgba(252,165,165,0.35)',
+    borderLeftColor: light ? 'rgba(255,255,255,0.65)' : 'rgba(252,165,165,0.18)',
+    borderRightColor: light ? 'rgba(255,255,255,0.5)' : 'rgba(252,165,165,0.1)',
+    borderBottomColor: light ? 'rgba(255,255,255,0.35)' : 'rgba(252,165,165,0.06)',
   },
   accessBannerText: {
     flex: 1,
@@ -487,10 +518,8 @@ export function createStyles(c: ThemePalette) {
     padding: 32,
   },
   renamePanel: {
-    backgroundColor: c.surface,
+    ...glass(0.78),
     borderRadius: 16,
-    borderWidth: 1,
-    borderColor: c.border,
     padding: 18,
   },
   renameTitle: {
@@ -500,10 +529,8 @@ export function createStyles(c: ThemePalette) {
     marginBottom: 12,
   },
   renameInput: {
-    backgroundColor: c.background,
+    ...glass(0.45),
     borderRadius: 10,
-    borderWidth: 1,
-    borderColor: c.border,
     color: c.foreground,
     fontSize: 14,
     paddingHorizontal: 12,
