@@ -16,6 +16,7 @@ import {
   scanDeviceForVideos,
   scanDeviceForPhotos,
 } from '@/utils/videoScanner';
+import { prepareThumbnails } from '@/utils/thumbnailCache';
 import { VideoItem, PhotoItem, toMilliseconds, normalizePath } from '../screens/home/shared';
 
 export function useHomeMedia() {
@@ -198,6 +199,8 @@ export function useHomeMedia() {
       }
 
       setPhotos(photoItems);
+      // 扫描完成：后台预热缩略图（native 串行解码，已缓存的自动跳过，越用越顺）
+      prepareThumbnails(photoItems.map((item) => item.uri));
     } catch (error) {
       console.error('Failed to load photos:', error);
     } finally {

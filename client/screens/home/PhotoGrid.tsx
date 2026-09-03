@@ -4,24 +4,41 @@
  * 从 home/index.tsx 的图片 FlatList + renderPhotoCard 拆出。
  * 列数状态由页面层 usePhotoGridColumns 提供（搜索栏的网格选择器共享同一状态）。
  *
- * 性能设计（v1.9.0）：
- * - 渐进分页渲染：data 只暴露前 visibleCount 张，onEndReached 追加一批。
- *   万级列表一次性挂载全部 cell 配置会让 VirtualizedList 的窗口管理变重，
- *   且深处图片解码队列拥塞表现为「滑到底不加载」；分批后每批只挂 300 张。
- * - resizeMethod="resize"：Android Fresco 解码时降采样到视图尺寸，
- *   避免每张 4-12MB 原图全尺寸解码进内存（卡顿与 OOM 的主因）。
+ * 性能设计：
+ * - 渐进分页渲染：data 只暴露前 visibleCount 张，onEndReached 追加一批（v1.9.0）
+ * - 缩略图加载：native 解码降采样小图 + 磁盘缓存，未就绪时回退原图（v1.9.1）
+ * - resizeMethod="resize"：原图回退期间也走 Fresco 降采样解码
  * - 渲染窗口按列数自适应：列数多时同屏 cell 成倍增加，
- *   initialNumToRender / maxToRenderPerBatch 随列数放大，windowSize 提到 11 防快速滚动空白。
+ *   initialNumToRender / maxToRenderPerBatch 随列数放大，windowSize 提到 11
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { FlatList, Image, TouchableOpacity } from 'react-native';
 import { GestureDetector, type GestureType } from 'react-native-gesture-handler';
 import { GRID_GAP, screenWidth, PhotoItem } from './shared';
+import { getThumbnailSync, subscribeThumbnails } from '@/utils/thumbnailCache';
 import { createStyles } from './styles';
 
 type Styles = ReturnType<typeof createStyles>;
 
 const PAGE_SIZE = 300;
+
+/** 缩略图单元格：命中缓存直接显示小图；未命中先显示原图，native 生成后自动切换 */
+function ThumbImage({ sourceUri, style }: { sourceUri: string; style: number | object }) {
+  const [uri, setUri] = useState<string>(() => getThumbnailSync(sourceUri) ?? sourceUri);
+
+  useEffect(() => {
+    // sourceUri 变化（cell 复用）时重新解析
+    const cached = getThumbnailSync(sourceUri);
+    setUri(cached ?? sourceUri);
+    if (cached) return;
+    const unsubscribe = subscribeThumbnails((changedUri, thumbUri) => {
+      if (changedUri === sourceUri) setUri(thumbUri);
+    });
+    return unsubscribe;
+  }, [sourceUri]);
+
+  return <Image source={{ uri }} style={style} resizeMode="cover" resizeMethod="resize" />;
+}
 
 interface PhotoGridProps {
   photos: PhotoItem[];
@@ -59,12 +76,7 @@ export function PhotoGrid({
         activeOpacity={0.7}
         onPress={() => onPressPhoto(item)}
       >
-        <Image
-          source={{ uri: item.uri }}
-          style={styles.photoImage}
-          resizeMode="cover"
-          resizeMethod="resize"
-        />
+        <ThumbImage sourceUri={item.uri} style={styles.photoImage} />
       </TouchableOpacity>
     ),
     [onPressPhoto, photoCardWidth, styles]

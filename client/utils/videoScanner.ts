@@ -5,6 +5,16 @@ const NativeStorageAccess = NativeModules.StorageAccess as
   | {
       isAllFilesAccessGranted?: () => boolean;
       renameFile?: (sourceUri: string, targetUri: string) => boolean;
+      scanMediaFiles?: (
+        extensions: string[],
+        maxDepth: number,
+        maxResults: number,
+        timeBudgetMs: number,
+        progressEvery: number,
+        progressCallback: (count: number) => void
+      ) => Promise<ScannedFile[]>;
+      getThumbnail?: (sourceUri: string, targetSize: number) => string | null;
+      prepareThumbnails?: (sources: string[], targetSize: number) => Promise<boolean>;
     }
   | undefined;
 
@@ -149,6 +159,23 @@ async function scanByExtensions(
   extensions: Set<string>,
   onProgress?: (count: number) => void
 ): Promise<ScannedFile[]> {
+  // native 优先：遍历与 IO 全在 native 线程执行，JS 线程零阻塞（v1.9.1 起）
+  if (typeof NativeStorageAccess?.scanMediaFiles === 'function') {
+    try {
+      return await NativeStorageAccess.scanMediaFiles(
+        Array.from(extensions),
+        MAX_DEPTH,
+        MAX_RESULTS,
+        TIME_BUDGET_MS,
+        100,
+        (count) => onProgress?.(count)
+      );
+    } catch (error) {
+      console.warn('native scan failed, fallback to js scan:', error);
+    }
+  }
+
+  // JS 兜底（web / iOS / native 异常时）：expo-file-system BFS
   const results: ScannedFile[] = [];
   const startedAt = Date.now();
   const queue: Array<{ dir: Directory; depth: number }> = [
