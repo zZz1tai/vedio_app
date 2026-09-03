@@ -10,14 +10,13 @@ import android.os.SystemClock
 import android.util.Log
 import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.Arguments
-import com.facebook.react.bridge.Callback
 import com.facebook.react.bridge.NativeModule
-import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.WritableArray
+import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.facebook.react.uimanager.ViewManager
 import java.io.File
@@ -55,22 +54,20 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
     private fun bridgeAlive(): Boolean = !destroyed && reactContext.hasActiveReactInstance()
 
     /**
-     * 把 JS 回调（Callback/Promise）投递到 JS 线程执行。
-     * RN 新架构（bridgeless）下从后台线程直接调用 Callback/Promise 是未定义行为，
-     * 会触发 C++ FATAL abort；必须 post 回 JS 线程。queue 已停止时安全丢弃。
+     * 事件通道（唯一与 JS 通信的方式）。
+     * 弃用 Callback/Promise 参数的原因：RN 0.81 bridgeless（新架构）下，
+     * 老式 @ReactMethod 的 Callback/Promise 在调用时（即使已切回 JS 线程）
+     * 会触发 C++ LogMessageFatal abort（interop 层缺陷）；事件发射是官方
+     * 支持的跨线程通道，本 app 的 onThumbnailReady 已大量实战验证安全。
      */
-    private fun postToJsThread(runnable: () -> Unit) {
-        if (destroyed || !reactContext.hasActiveReactInstance()) return
+    private fun emit(event: String, payload: WritableMap) {
+        if (!bridgeAlive()) return
         try {
-            reactContext.runOnJSQueueThread {
-                try {
-                    runnable()
-                } catch (error: Throwable) {
-                    Log.w(TAG, "js-thread callback failed", error)
-                }
-            }
+            reactContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit(event, payload)
         } catch (error: Throwable) {
-            Log.w(TAG, "postToJsThread failed (bridge gone?)", error)
+            Log.w(TAG, "emit $event failed", error)
         }
     }
 
@@ -133,9 +130,12 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
     }
 
     /**
-     * 全盘扫描（native 化）：BFS 遍历主存储，IO 与遍历在 native 线程执行，
+     * 全盘扫描（native 化，事件驱动）：BFS 遍历主存储，IO 与遍历在 native 线程执行，
      * JS 线程零阻塞。语义与原 JS 版本对齐：深度上限、跳过目录、结果上限、时间预算。
-     * progressCallback 可多次调用（RN 内部会切回 native modules 线程）。
+     *
+     * 不用 Callback/Promise 参数：RN 0.81 bridgeless 下它们会触发 C++ FATAL abort
+     * （三份小米 tombstone 实证）。进度/完成/失败一律经事件通道上报，
+     * scanId 由 JS 生成，用于区分并发扫描与丢弃过期结果。
      */
     @ReactMethod
     fun scanMediaFiles(
@@ -144,8 +144,7 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
         maxResults: Int,
         timeBudgetMs: Double,
         progressEvery: Int,
-        progressCallback: Callback,
-        promise: Promise
+        scanId: String
     ) {
         val exts = HashSet<String>()
         for (i in 0 until extensions.size()) {
@@ -190,20 +189,37 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
                         if (progressEvery > 0 && count - lastProgress >= progressEvery) {
                             lastProgress = count
                             if (!bridgeAlive()) break
-                            // 回调必须投递回 JS 线程：新架构后台线程直调 Callback 会 C++ FATAL abort
-                            postToJsThread { progressCallback.invoke(count) }
+                            emit(
+                                "mediaScanProgress",
+                                Arguments.createMap().apply {
+                                    putString("scanId", scanId)
+                                    putDouble("count", count.toDouble())
+                                }
+                            )
                         }
                     }
                 }
                 if (!bridgeAlive()) {
                     Log.i(TAG, "scan aborted: bridge destroyed (found $count files)")
                 } else {
-                    postToJsThread { promise.resolve(results) }
+                    emit(
+                        "mediaScanDone",
+                        Arguments.createMap().apply {
+                            putString("scanId", scanId)
+                            putArray("data", results)
+                        }
+                    )
                 }
             } catch (error: Throwable) {
                 Log.w(TAG, "scanMediaFiles failed", error)
                 if (bridgeAlive()) {
-                    postToJsThread { promise.reject("SCAN_ERROR", error.message, error) }
+                    emit(
+                        "mediaScanError",
+                        Arguments.createMap().apply {
+                            putString("scanId", scanId)
+                            putString("message", error.message ?: "scan failed")
+                        }
+                    )
                 }
             }
         }
@@ -242,9 +258,9 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
         return null
     }
 
-    /** 批量预热：扫描完成后调用，后台串行解码，命中缓存的自动跳过（fire and forget） */
+    /** 批量预热：扫描完成后调用，后台串行解码，命中缓存的自动跳过（fire and forget，无返回） */
     @ReactMethod
-    fun prepareThumbnails(sources: ReadableArray, targetSize: Double, promise: Promise) {
+    fun prepareThumbnails(sources: ReadableArray, targetSize: Double) {
         val size = targetSize.toInt().coerceAtLeast(128)
         val uris = ArrayList<String>(sources.size())
         for (i in 0 until sources.size()) {
@@ -268,9 +284,6 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             maybeCleanupThumbCache()
-            if (bridgeAlive()) {
-                postToJsThread { promise.resolve(true) }
-            }
         }
     }
 

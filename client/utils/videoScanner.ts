@@ -1,5 +1,5 @@
 import { Directory, File } from 'expo-file-system';
-import { NativeModules, Platform } from 'react-native';
+import { DeviceEventEmitter, NativeModules, Platform } from 'react-native';
 
 const NativeStorageAccess = NativeModules.StorageAccess as
   | {
@@ -11,10 +11,10 @@ const NativeStorageAccess = NativeModules.StorageAccess as
         maxResults: number,
         timeBudgetMs: number,
         progressEvery: number,
-        progressCallback: (count: number) => void
-      ) => Promise<ScannedFile[]>;
+        scanId: string
+      ) => void;
       getThumbnail?: (sourceUri: string, targetSize: number) => string | null;
-      prepareThumbnails?: (sources: string[], targetSize: number) => Promise<boolean>;
+      prepareThumbnails?: (sources: string[], targetSize: number) => void;
     }
   | undefined;
 
@@ -155,6 +155,65 @@ interface ScannedFile {
   modificationTime: number;
 }
 
+/**
+ * native 扫描（事件驱动版，v2.0.3 起）。
+ * native 侧弃用 Callback/Promise（bridgeless 下触发 C++ abort），
+ * 进度/完成/失败经 mediaScan* 事件上报，scanId 区分并发扫描。
+ */
+function nativeScanMediaFiles(
+  extensions: string[],
+  onProgress?: (count: number) => void
+): Promise<ScannedFile[]> {
+  return new Promise((resolve, reject) => {
+    if (typeof NativeStorageAccess?.scanMediaFiles !== 'function') {
+      reject(new Error('native scan unavailable'));
+      return;
+    }
+    const scanId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+    const progressSub = DeviceEventEmitter.addListener('mediaScanProgress', (e) => {
+      if (e?.scanId !== scanId) return;
+      onProgress?.(typeof e.count === 'number' ? e.count : 0);
+    });
+    const doneSub = DeviceEventEmitter.addListener('mediaScanDone', (e) => {
+      if (e?.scanId !== scanId) return;
+      finish();
+      resolve(Array.isArray(e?.data) ? e.data : []);
+    });
+    const errorSub = DeviceEventEmitter.addListener('mediaScanError', (e) => {
+      if (e?.scanId !== scanId) return;
+      finish();
+      reject(new Error(typeof e?.message === 'string' ? e.message : 'scan failed'));
+    });
+    // 兜底：native 预算 15s + 排队余量，事件若因异常丢失不悬挂 promise
+    const timer = setTimeout(() => {
+      finish();
+      reject(new Error('scan timeout'));
+    }, 60_000);
+
+    function finish() {
+      clearTimeout(timer);
+      progressSub.remove();
+      doneSub.remove();
+      errorSub.remove();
+    }
+
+    try {
+      NativeStorageAccess.scanMediaFiles(
+        extensions,
+        MAX_DEPTH,
+        MAX_RESULTS,
+        TIME_BUDGET_MS,
+        100,
+        scanId
+      );
+    } catch (error) {
+      finish();
+      reject(error as Error);
+    }
+  });
+}
+
 async function scanByExtensions(
   extensions: Set<string>,
   onProgress?: (count: number) => void
@@ -162,14 +221,7 @@ async function scanByExtensions(
   // native 优先：遍历与 IO 全在 native 线程执行，JS 线程零阻塞（v1.9.1 起）
   if (typeof NativeStorageAccess?.scanMediaFiles === 'function') {
     try {
-      return await NativeStorageAccess.scanMediaFiles(
-        Array.from(extensions),
-        MAX_DEPTH,
-        MAX_RESULTS,
-        TIME_BUDGET_MS,
-        100,
-        (count) => onProgress?.(count)
-      );
+      return await nativeScanMediaFiles(Array.from(extensions), onProgress);
     } catch (error) {
       console.warn('native scan failed, fallback to js scan:', error);
     }

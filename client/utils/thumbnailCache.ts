@@ -14,7 +14,7 @@ import { Directory, File, Paths } from 'expo-file-system';
 const NativeStorageAccess = NativeModules.StorageAccess as
   | {
       getThumbnail?: (sourceUri: string, targetSize: number) => string | null;
-      prepareThumbnails?: (sources: string[], targetSize: number) => Promise<boolean>;
+      prepareThumbnails?: (sources: string[], targetSize: number) => void;
     }
   | undefined;
 
@@ -71,10 +71,10 @@ export function subscribeThumbnails(
   };
 }
 
-/** 批量预热（fire and forget）：native 后台串行解码，已缓存自动跳过 */
+/** 批量预热（fire and forget）：native 后台串行解码，已缓存自动跳过，无返回（v2.0.3 起 native 弃用 Promise） */
 export function prepareThumbnails(sources: string[], targetSize = DEFAULT_THUMB_SIZE): void {
   try {
-    NativeStorageAccess?.prepareThumbnails?.(sources, targetSize)?.catch?.(() => undefined);
+    NativeStorageAccess?.prepareThumbnails?.(sources, targetSize);
   } catch {
     // 预热失败无感
   }
