@@ -61,5 +61,21 @@ class ExpoVideoAiModule : Module() {
       WorkManager.getInstance(context).cancelUniqueWork(AiVideoExportWorker.WORK_NAME)
       job?.toMap()
     }
+
+    AsyncFunction("upscaleImage") { values: Map<String, Any?> ->
+      val context = appContext.reactContext?.applicationContext
+        ?: throw IllegalStateException("应用上下文不可用")
+      val inputUri = values["inputUri"]?.toString()?.trim().orEmpty()
+      require(inputUri.isNotBlank()) { "缺少图片地址" }
+      val scale = (values["scale"] as? Number)?.toInt()?.takeIf { it == 2 || it == 4 } ?: 4
+      // 返回 Map 而非自定义 data class：Expo Modules 桥只支持 Map/List/基本类型序列化，
+      // 直接返回 AiImageUpscaleResult 会抛 "Unknown type" 序列化异常
+      val result = AiImageUpscalePipeline(context).upscale(inputUri, scale, onProgress = { })
+      mapOf(
+        "outputUri" to result.outputUri,
+        "width" to result.width,
+        "height" to result.height,
+      )
+    }
   }
 }

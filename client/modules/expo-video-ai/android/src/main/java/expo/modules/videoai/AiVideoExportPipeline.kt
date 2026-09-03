@@ -1,14 +1,12 @@
 package expo.modules.videoai
 
-import android.content.Context
 import android.content.ContentValues
+import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Color
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
-import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.media.MediaScannerConnection
 import android.net.Uri
@@ -20,8 +18,8 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.opengl.GLUtils
-import android.os.Environment
 import android.os.Build
+import android.os.Environment
 import android.provider.MediaStore
 import android.view.Surface
 import java.io.File
@@ -30,7 +28,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.ceil
 import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.roundToLong
 
 internal class AiVideoExportCancelledException : RuntimeException()
 
@@ -48,127 +46,211 @@ internal class AiVideoExportPipeline(private val context: Context) {
     shouldCancel: () -> Boolean,
     onProgress: (VideoAiStage, Double, Int, Int) -> Unit
   ): AiVideoExportResult {
-    val probe = probe(request.inputUri)
-    require(probe.width > 0 && probe.height > 0) { "无法读取视频分辨率" }
-    require(probe.durationUs > 0) { "无法读取视频时长" }
-    require(probe.durationUs <= MAX_DURATION_US) {
-      "首版 AI 导出仅支持 60 秒以内的视频"
-    }
-
-    val modelRoot = AiModelInstaller.ensure(context)
-    if (!AiNativeEngine.initialize(modelRoot.absolutePath)) {
-      throw IllegalStateException(
-        AiNativeEngine.lastError().ifBlank { "无法初始化 Real-ESRGAN / RIFE 模型" }
-      )
-    }
-
-    val sourceFrameDurationUs = max(1L, (1_000_000.0 / probe.fps).toLong())
-    val sourceFrames = max(1, ceil(probe.durationUs.toDouble() / sourceFrameDurationUs).toInt())
-    val outputFrames = if (request.interpolation == "x2") {
-      max(1, sourceFrames * 2 - 1)
-    } else {
-      sourceFrames
-    }
-    val outputFps = min(if (request.interpolation == "x2") probe.fps * 2 else probe.fps, 60.0)
-    val outputFrameDurationUs = max(1L, (1_000_000.0 / outputFps).toLong())
-
-    val retriever = MediaMetadataRetriever()
-    setRetrieverSource(retriever, context, request.inputUri)
-    val first = frameAt(retriever, 0)
-    val outputWidth = even(if (request.scale == 2) first.width * 2 else first.width)
-    val outputHeight = even(if (request.scale == 2) first.height * 2 else first.height)
-    require(outputWidth <= MAX_OUTPUT_WIDTH && outputHeight <= MAX_OUTPUT_HEIGHT) {
-      "输出分辨率超过 ${MAX_OUTPUT_WIDTH}x${MAX_OUTPUT_HEIGHT} 限制"
-    }
-
-    val outputFile = outputFileFor(request.displayName)
-    val encoder = H264Mp4Encoder(
-      context,
-      request.inputUri,
-      outputFile,
-      outputWidth,
-      outputHeight,
-      outputFps,
-      request.preset
-    )
-    var previous: Bitmap? = first
-    var encodedFrames = 0
-
-    try {
-      onProgress(VideoAiStage.PREPARING, 0.02, 0, outputFrames)
-      for (frameIndex in 1 until sourceFrames) {
-        ensureNotCancelled(shouldCancel)
-        val current = frameAt(retriever, frameIndex * sourceFrameDurationUs)
-        val previousFrame = previous ?: throw IllegalStateException("缺少前一帧")
-
-        val enhancedPrevious = enhanceFrame(previousFrame, request.scale, outputWidth, outputHeight, shouldCancel)
-        encoder.writeFrame(enhancedPrevious, encodedFrames * outputFrameDurationUs)
-        recycleIfOwned(enhancedPrevious, previousFrame)
-        encodedFrames += 1
-        onProgress(
-          VideoAiStage.UPSCALING,
-          exportProgress(encodedFrames, outputFrames),
-          encodedFrames,
-          outputFrames
-        )
-
-        if (request.interpolation == "x2") {
-          ensureNotCancelled(shouldCancel)
-          onProgress(
-            VideoAiStage.INTERPOLATING,
-            exportProgress(encodedFrames, outputFrames),
-            encodedFrames,
-            outputFrames
-          )
-          val intermediate = if (isLikelySceneCut(previousFrame, current)) {
-            previousFrame.copy(Bitmap.Config.ARGB_8888, false)
-          } else {
-            AiNativeEngine.interpolate(previousFrame, current)
-          }
-          val enhancedIntermediate = enhanceFrame(intermediate, request.scale, outputWidth, outputHeight, shouldCancel)
-          encoder.writeFrame(enhancedIntermediate, encodedFrames * outputFrameDurationUs)
-          recycleIfOwned(enhancedIntermediate, intermediate)
-          if (intermediate !== previousFrame && !intermediate.isRecycled) intermediate.recycle()
-          encodedFrames += 1
-          onProgress(
-            VideoAiStage.UPSCALING,
-            exportProgress(encodedFrames, outputFrames),
-            encodedFrames,
-            outputFrames
-          )
-        }
-
-        if (!previousFrame.isRecycled) previousFrame.recycle()
-        previous = current
+    val source = VideoFrameSource.open(context, request.inputUri)
+    return source.use { frameSource ->
+      val probe = frameSource.probe
+      require(probe.durationUs <= MAX_DURATION_US) {
+        "首版 AI 导出仅支持 ${MAX_DURATION_US / 1_000_000} 秒以内的视频"
       }
 
-      val finalFrame = previous ?: throw IllegalStateException("无法读取视频帧")
-      val enhancedFinal = enhanceFrame(finalFrame, request.scale, outputWidth, outputHeight, shouldCancel)
-      encoder.writeFrame(enhancedFinal, encodedFrames * outputFrameDurationUs)
-      recycleIfOwned(enhancedFinal, finalFrame)
-      if (!finalFrame.isRecycled) finalFrame.recycle()
-      previous = null
-      encodedFrames += 1
+      val modelRoot = AiModelInstaller.ensure(context)
+      if (!AiNativeEngine.initialize(modelRoot.absolutePath)) {
+        throw IllegalStateException(
+          AiNativeEngine.lastError().ifBlank { "无法初始化 Real-ESRGAN / RIFE 模型" }
+        )
+      }
+      AiNativeEngine.setTileSize(if (request.preset == "quality") TILE_QUALITY else TILE_BALANCED)
 
-      ensureNotCancelled(shouldCancel)
-      onProgress(VideoAiStage.MUXING, 0.97, encodedFrames, outputFrames)
-      encoder.finish(shouldCancel)
-      val outputUri = publishOutput(outputFile, request.displayName)
-      onProgress(VideoAiStage.MUXING, 1.0, encodedFrames, outputFrames)
-      return AiVideoExportResult(
-        outputUri = outputUri,
-        width = outputWidth,
-        height = outputHeight,
-        fps = outputFps,
-        totalFrames = encodedFrames
+      val firstFrame = frameSource.next() ?: throw IllegalStateException("无法解码视频首帧")
+      val outputWidth = even(if (request.scale == 2) probe.width * 2 else probe.width)
+      val outputHeight = even(if (request.scale == 2) probe.height * 2 else probe.height)
+      require(outputWidth <= MAX_OUTPUT_WIDTH && outputHeight <= MAX_OUTPUT_HEIGHT) {
+        "输出分辨率超过 ${MAX_OUTPUT_WIDTH}x${MAX_OUTPUT_HEIGHT} 限制"
+      }
+
+      // 插帧后帧率翻倍，超出编码器上限时放弃插帧而不是压缩时间戳，
+      // 否则实际帧数与帧率对不上，成片会整体变速。
+      val sourceFps = probe.fps
+      val wantsInterpolation = request.interpolation == "x2"
+      val interpolated = wantsInterpolation && sourceFps * 2 <= MAX_OUTPUT_FPS
+      val outputFps = if (interpolated) sourceFps * 2 else sourceFps
+      val outputFrameDurationUs = max(1L, (1_000_000.0 / outputFps).roundToLong())
+
+      val sourceFrameCount = if (probe.frameCount > 0) {
+        probe.frameCount
+      } else {
+        max(1, ceil(probe.durationUs.toDouble() / (1_000_000.0 / sourceFps)).toInt())
+      }
+      val estimatedOutputFrames = if (interpolated) {
+        max(1, sourceFrameCount * 2 - 1)
+      } else {
+        sourceFrameCount
+      }
+
+      val outputFile = outputFileFor(request.displayName)
+      val encoder = H264Mp4Encoder(
+        context,
+        request.inputUri,
+        outputFile,
+        outputWidth,
+        outputHeight,
+        outputFps,
+        request.preset,
+        probe.rotation
       )
+
+      var previous: Bitmap? = firstFrame
+      var encodedFrames = 0
+      val throttle = ProgressThrottle(onProgress)
+
+      try {
+        onProgress(VideoAiStage.PREPARING, 0.02, 0, estimatedOutputFrames)
+        while (true) {
+          ensureNotCancelled(shouldCancel)
+          val current = frameSource.next() ?: break
+          val previousFrame = previous ?: throw IllegalStateException("缺少前一帧")
+
+          // A 帧只超分一次。插帧走降级路径时（重复帧 / 大运动 / 光流未收敛），
+          // 中间帧直接复用这份增强结果，省掉一次全尺寸 Real-ESRGAN 推理。
+          val enhancedA = enhanceFrame(
+            source = previousFrame,
+            scale = request.scale,
+            targetWidth = outputWidth,
+            targetHeight = outputHeight,
+            shouldCancel = shouldCancel
+          )
+          try {
+            encoder.writeFrame(enhancedA, encodedFrames * outputFrameDurationUs)
+            encodedFrames += 1
+            throttle.report(
+              VideoAiStage.UPSCALING,
+              exportProgress(encodedFrames, estimatedOutputFrames),
+              encodedFrames,
+              estimatedOutputFrames
+            )
+
+            if (interpolated) {
+              ensureNotCancelled(shouldCancel)
+              throttle.report(
+                VideoAiStage.INTERPOLATING,
+                exportProgress(encodedFrames, estimatedOutputFrames),
+                encodedFrames,
+                estimatedOutputFrames
+              )
+              val intermediate = buildIntermediateFrame(
+                previous = previousFrame,
+                current = current,
+                enhancedPrevious = enhancedA,
+                request = request,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                shouldCancel = shouldCancel
+              )
+              try {
+                encoder.writeFrame(intermediate, encodedFrames * outputFrameDurationUs)
+              } finally {
+                if (intermediate !== enhancedA && !intermediate.isRecycled) intermediate.recycle()
+              }
+              encodedFrames += 1
+              throttle.report(
+                VideoAiStage.UPSCALING,
+                exportProgress(encodedFrames, estimatedOutputFrames),
+                encodedFrames,
+                estimatedOutputFrames
+              )
+            }
+          } finally {
+            // 增强结果是独立位图时需要回收；复用源帧本身时则交还解码帧池
+            if (enhancedA !== previousFrame && !enhancedA.isRecycled) enhancedA.recycle()
+          }
+
+          frameSource.release(previousFrame)
+          previous = current
+        }
+
+        val finalFrame = previous ?: throw IllegalStateException("无法读取视频帧")
+        val enhancedFinal = enhanceFrame(
+          source = finalFrame,
+          scale = request.scale,
+          targetWidth = outputWidth,
+          targetHeight = outputHeight,
+          shouldCancel = shouldCancel
+        )
+        try {
+          encoder.writeFrame(enhancedFinal, encodedFrames * outputFrameDurationUs)
+        } finally {
+          if (enhancedFinal !== finalFrame && !enhancedFinal.isRecycled) enhancedFinal.recycle()
+        }
+        encodedFrames += 1
+        frameSource.release(finalFrame)
+        previous = null
+
+        ensureNotCancelled(shouldCancel)
+        onProgress(VideoAiStage.MUXING, 0.97, encodedFrames, encodedFrames)
+        encoder.finish(shouldCancel)
+        val outputUri = publishOutput(outputFile, request.displayName)
+        onProgress(VideoAiStage.MUXING, 1.0, encodedFrames, encodedFrames)
+        AiVideoExportResult(
+          outputUri = outputUri,
+          width = outputWidth,
+          height = outputHeight,
+          fps = outputFps,
+          totalFrames = encodedFrames
+        )
+      } catch (error: Throwable) {
+        encoder.abort()
+        outputFile.delete()
+        throw error
+      } finally {
+        previous?.let { frameSource.release(it) }
+      }
+    }
+  }
+
+  /**
+   * 生成两帧之间的中间帧，并放大到输出尺寸。
+   *
+   * 这里做两级降级，是插帧质量与性能的关键：
+   * 1. 两帧几乎一致（重复帧）时直接复用 [enhancedPrevious]（A 帧的超分结果），
+   *    输出内容与复制前一帧完全一致，但省掉一次全尺寸 Real-ESRGAN 推理；
+   * 2. 两帧差异过大（转场、剧烈运动）时同样复用 —— 这种情况下光流没有解，
+   *    强行插值只会得到撕裂的鬼影；
+   * 3. RIFE 返回 null（原生层判定光流未收敛）时也复用。
+   *
+   * 只有 RIFE 真正产出中间帧时才会额外跑一次超分。
+   * 返回值可能与 [enhancedPrevious] 是同一实例，调用方据此判断是否回收。
+   */
+  private fun buildIntermediateFrame(
+    previous: Bitmap,
+    current: Bitmap,
+    enhancedPrevious: Bitmap,
+    request: VideoAiRequest,
+    outputWidth: Int,
+    outputHeight: Int,
+    shouldCancel: () -> Boolean
+  ): Bitmap {
+    val motion = AiNativeEngine.motionScore(previous, current)
+    val interpolatedBitmap = when {
+      motion < 0.0 -> AiNativeEngine.interpolateOrNull(previous, current)
+      motion < DUPLICATE_MOTION -> null
+      motion > MAX_INTERPOLATABLE_MOTION -> null
+      else -> AiNativeEngine.interpolateOrNull(previous, current)
+    } ?: return enhancedPrevious
+    return try {
+      val enhanced = enhanceFrame(
+        source = interpolatedBitmap,
+        scale = request.scale,
+        targetWidth = outputWidth,
+        targetHeight = outputHeight,
+        shouldCancel = shouldCancel
+      )
+      if (enhanced !== interpolatedBitmap && !interpolatedBitmap.isRecycled) {
+        interpolatedBitmap.recycle()
+      }
+      enhanced
     } catch (error: Throwable) {
-      encoder.abort()
-      outputFile.delete()
+      if (!interpolatedBitmap.isRecycled) interpolatedBitmap.recycle()
       throw error
-    } finally {
-      previous?.takeIf { !it.isRecycled }?.recycle()
-      retriever.release()
     }
   }
 
@@ -180,49 +262,18 @@ internal class AiVideoExportPipeline(private val context: Context) {
     shouldCancel: () -> Boolean
   ): Bitmap {
     ensureNotCancelled(shouldCancel)
-    val processed = if (scale == 2) AiNativeEngine.upscale(source) else source.copy(Bitmap.Config.ARGB_8888, false)
+    // scale != 2 时不再整帧复制：尺寸已匹配就直接返回源帧本身，
+    // 调用方以「结果 !== 源帧」来决定回收，源帧仍可安全归还帧池。
+    val processed = if (scale == 2) {
+      AiNativeEngine.upscale(source)
+    } else {
+      source
+    }
     ensureNotCancelled(shouldCancel)
     if (processed.width == targetWidth && processed.height == targetHeight) return processed
     val resized = Bitmap.createScaledBitmap(processed, targetWidth, targetHeight, true)
-    if (resized !== processed && !processed.isRecycled) processed.recycle()
+    if (resized !== processed && processed !== source && !processed.isRecycled) processed.recycle()
     return resized
-  }
-
-  private fun probe(inputUri: String): VideoProbe {
-    val retriever = MediaMetadataRetriever()
-    return try {
-      setRetrieverSource(retriever, context, inputUri)
-      val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-      val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-      val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-      val metadataFps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-        ?.toDoubleOrNull()
-      VideoProbe(width, height, durationMs * 1_000L, (metadataFps ?: extractorFps(inputUri)).coerceIn(12.0, 30.0))
-    } finally {
-      retriever.release()
-    }
-  }
-
-  private fun extractorFps(inputUri: String): Double {
-    val extractor = MediaExtractor()
-    return try {
-      setExtractorSource(extractor, context, inputUri)
-      (0 until extractor.trackCount)
-        .map { extractor.getTrackFormat(it) }
-        .firstOrNull { it.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true }
-        ?.let { format ->
-          if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) format.getInteger(MediaFormat.KEY_FRAME_RATE).toDouble() else 30.0
-        }
-        ?.takeIf { it > 0 } ?: 30.0
-    } finally {
-      extractor.release()
-    }
-  }
-
-  private fun frameAt(retriever: MediaMetadataRetriever, timeUs: Long): Bitmap {
-    val frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-      ?: throw IllegalStateException("无法解码视频帧")
-    return if (frame.config == Bitmap.Config.ARGB_8888) frame else frame.copy(Bitmap.Config.ARGB_8888, false).also { frame.recycle() }
   }
 
   private fun outputFileFor(displayName: String): File {
@@ -262,28 +313,6 @@ internal class AiVideoExportPipeline(private val context: Context) {
     }
   }
 
-  private fun isLikelySceneCut(first: Bitmap, second: Bitmap): Boolean {
-    var delta = 0L
-    var samples = 0
-    for (row in 1..8) {
-      val y = (first.height - 1) * row / 9
-      for (column in 1..8) {
-        val x = (first.width - 1) * column / 9
-        val firstColor = first.getPixel(x, y)
-        val secondColor = second.getPixel(min(x, second.width - 1), min(y, second.height - 1))
-        delta += kotlin.math.abs(Color.red(firstColor) - Color.red(secondColor))
-        delta += kotlin.math.abs(Color.green(firstColor) - Color.green(secondColor))
-        delta += kotlin.math.abs(Color.blue(firstColor) - Color.blue(secondColor))
-        samples += 3
-      }
-    }
-    return delta.toDouble() / samples > 58.0
-  }
-
-  private fun recycleIfOwned(bitmap: Bitmap, source: Bitmap) {
-    if (bitmap !== source && !bitmap.isRecycled) bitmap.recycle()
-  }
-
   private fun ensureNotCancelled(shouldCancel: () -> Boolean) {
     if (shouldCancel()) {
       AiNativeEngine.cancel()
@@ -296,12 +325,17 @@ internal class AiVideoExportPipeline(private val context: Context) {
 
   private fun even(value: Int): Int = if (value % 2 == 0) value else value - 1
 
-  private data class VideoProbe(val width: Int, val height: Int, val durationUs: Long, val fps: Double)
-
   companion object {
     private const val MAX_DURATION_US = 60_000_000L
     private const val MAX_OUTPUT_WIDTH = 3840
     private const val MAX_OUTPUT_HEIGHT = 2160
+    private const val MAX_OUTPUT_FPS = 120.0
+    private const val TILE_BALANCED = 256
+    private const val TILE_QUALITY = 192
+    /** 低于该值认为两帧是重复帧。 */
+    private const val DUPLICATE_MOTION = 0.5
+    /** 高于该值认为运动过大或存在转场，放弃插值。 */
+    private const val MAX_INTERPOLATABLE_MOTION = 58.0
 
     internal fun setExtractorSource(extractor: MediaExtractor, context: Context, inputUri: String) {
       val uri = Uri.parse(inputUri)
@@ -313,17 +347,25 @@ internal class AiVideoExportPipeline(private val context: Context) {
         extractor.setDataSource(inputUri)
       }
     }
+  }
+}
 
-    internal fun setRetrieverSource(retriever: MediaMetadataRetriever, context: Context, inputUri: String) {
-      val uri = Uri.parse(inputUri)
-      if (uri.scheme == "content") {
-        retriever.setDataSource(context, uri)
-      } else if (uri.scheme == "file") {
-        retriever.setDataSource(uri.path ?: inputUri)
-      } else {
-        retriever.setDataSource(inputUri)
-      }
-    }
+/** 进度回调节流：每帧都写一次 SharedPreferences 会形成 I/O 风暴，明显拖慢导出。 */
+private class ProgressThrottle(
+  private val onProgress: (VideoAiStage, Double, Int, Int) -> Unit
+) {
+  private var lastReportAt = 0L
+
+  fun report(stage: VideoAiStage, progress: Double, processed: Int, total: Int) {
+    val now = System.currentTimeMillis()
+    val important = progress <= 0.0 || progress >= 1.0
+    if (!important && now - lastReportAt < MIN_INTERVAL_MS) return
+    lastReportAt = now
+    onProgress(stage, progress, processed, total)
+  }
+
+  private companion object {
+    const val MIN_INTERVAL_MS = 400L
   }
 }
 
@@ -333,8 +375,9 @@ private class H264Mp4Encoder(
   private val outputFile: File,
   private val width: Int,
   private val height: Int,
-  private val fps: Double,
-  private val preset: String
+  fps: Double,
+  private val preset: String,
+  private val orientation: Int
 ) {
   private val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
   private val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -349,12 +392,12 @@ private class H264Mp4Encoder(
   init {
     val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
       setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-      val qualityMultiplier = if (preset == "quality") 1.45 else 1.0
+      val bitsPerPixel = if (preset == "quality") 0.14 else 0.10
       setInteger(
         MediaFormat.KEY_BIT_RATE,
-        (width * height * fps * 0.12 * qualityMultiplier).toInt().coerceIn(2_000_000, 24_000_000)
+        (width * height * fps * bitsPerPixel).toLong().coerceIn(2_000_000L, 40_000_000L).toInt()
       )
-      setInteger(MediaFormat.KEY_FRAME_RATE, fps.toInt())
+      setInteger(MediaFormat.KEY_FRAME_RATE, fps.roundToLong().toInt())
       setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
     }
     encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -398,6 +441,7 @@ private class H264Mp4Encoder(
           check(!muxerStarted) { "编码器输出格式重复变化" }
           videoTrack = muxer.addTrack(encoder.outputFormat)
           audioSource.format?.let { audioTrack = muxer.addTrack(it) }
+          if (orientation != 0) muxer.setOrientationHint(orientation)
           muxer.start()
           muxerStarted = true
         }
@@ -526,6 +570,8 @@ private class BitmapFrameRenderer {
   private val textureHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
   private val samplerHandle = GLES20.glGetUniformLocation(program, "uTexture")
   private val textureId = IntArray(1)
+  private var textureWidth = 0
+  private var textureHeight = 0
 
   init {
     GLES20.glGenTextures(1, textureId, 0)
@@ -543,7 +589,14 @@ private class BitmapFrameRenderer {
     GLES20.glUseProgram(program)
     GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
     GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId[0])
-    GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+    // 只有首帧或尺寸变化时才重建纹理存储，其余帧复用已分配的显存
+    if (bitmap.width != textureWidth || bitmap.height != textureHeight) {
+      GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+      textureWidth = bitmap.width
+      textureHeight = bitmap.height
+    } else {
+      GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bitmap)
+    }
     GLES20.glUniform1i(samplerHandle, 0)
 
     vertexBuffer.position(0)

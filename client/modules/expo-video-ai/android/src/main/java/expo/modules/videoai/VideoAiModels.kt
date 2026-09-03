@@ -179,11 +179,13 @@ internal class VideoAiJobStore(context: Context) {
 }
 
 internal object AiModelInstaller {
-  private const val VERSION = "v2"
+  private const val VERSION = "v4"
   private const val MARKER = ".ready"
   private val assets = listOf(
     "ai-models/realesr-animevideov3-x2.param",
     "ai-models/realesr-animevideov3-x2.bin",
+    "ai-models/realesr-general-x4v3.param",
+    "ai-models/realesr-general-x4v3.bin",
     "ai-models/rife-v4.6/flownet.param",
     "ai-models/rife-v4.6/flownet.bin"
   )

@@ -14,6 +14,7 @@ import {
   Modal,
   AppState,
   Keyboard,
+  Image,
 } from 'react-native';
 import { FontAwesome6 } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -29,14 +30,22 @@ import {
   hasAllFilesAccess,
   renameVideoFile,
   scanDeviceForVideos,
+  scanDeviceForPhotos,
 } from '@/utils/videoScanner';
 import { useCSSVariable } from 'uniwind';
 import { useThemePreference, type ThemePreference } from '@/contexts/ThemeContext';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 
 const { width: screenWidth } = Dimensions.get('window');
 const GRID_GAP = 12;
 const GRID_COLUMNS = 2;
 const CARD_WIDTH = (screenWidth - GRID_GAP * 3) / 2;
+const PHOTO_COLUMNS = 3;
+const PHOTO_COLUMN_OPTIONS = [2, 3, 4, 5, 6, 7, 8, 10, 12] as const;
+const PHOTO_COLUMN_MIN = PHOTO_COLUMN_OPTIONS[0];
+const PHOTO_COLUMN_MAX = PHOTO_COLUMN_OPTIONS[PHOTO_COLUMN_OPTIONS.length - 1];
+const PHOTO_COLUMNS_STORAGE_KEY = 'app.photo.gridColumns';
 
 interface VideoItem {
   id: string;
@@ -49,6 +58,18 @@ interface VideoItem {
   modificationTime: number;
   mimeType: string;
 }
+
+interface PhotoItem {
+  id: string;
+  uri: string;
+  filename: string;
+  width: number;
+  height: number;
+  modificationTime: number;
+  fileSize: number;
+}
+
+type HomeTab = 'video' | 'photo';
 
 const toMilliseconds = (value: number) => (value > 1e12 ? value : value * 1000);
 
@@ -284,6 +305,15 @@ export default function HomeScreen() {
   const [renaming, setRenaming] = useState(false);
   const [allFilesAccessGranted, setAllFilesAccessGranted] = useState(true);
   const pendingAllFilesRecheck = useRef(false);
+  const [activeTab, setActiveTab] = useState<HomeTab>('video');
+  const [photos, setPhotos] = useState<PhotoItem[]>([]);
+  const [photosLoading, setPhotosLoading] = useState(false);
+  const [scanCount, setScanCount] = useState(0);
+  const [photoSearch, setPhotoSearch] = useState('');
+  const [photoColumns, setPhotoColumns] = useState<number>(PHOTO_COLUMNS);
+  const [gridPickerOpen, setGridPickerOpen] = useState(false);
+  const photoColumnsRef = useRef(PHOTO_COLUMNS);
+  const pinchBaseRef = useRef(PHOTO_COLUMNS);
 
   const isSearching = searchQuery.length > 0;
   const searchTokens = useMemo(() => {
@@ -371,23 +401,34 @@ export default function HomeScreen() {
     try {
       setLoading(true);
 
-      const assets = await MediaLibrary.getAssetsAsync({
-        mediaType: 'video',
-        sortBy: ['modificationTime'],
-        first: 500,
-      });
-
-      const videoItems: VideoItem[] = assets.assets.map((asset) => ({
-        id: asset.id,
-        uri: asset.uri,
-        filename: asset.filename || 'Unknown',
-        duration: asset.duration || 0,
-        width: asset.width || 0,
-        height: asset.height || 0,
-        fileSize: 0,
-        modificationTime: asset.modificationTime || 0,
-        mimeType: '',
-      }));
+      // 媒体库单次最多返回 500 条，用 after 游标分页拉全（上限 5000 条防极端）
+      const videoItems: VideoItem[] = [];
+      let after: string | undefined;
+      const MEDIA_LIBRARY_PAGE = 500;
+      const MEDIA_LIBRARY_LIMIT = 5000;
+      do {
+        const page = await MediaLibrary.getAssetsAsync({
+          mediaType: 'video',
+          sortBy: ['modificationTime'],
+          first: MEDIA_LIBRARY_PAGE,
+          after,
+        });
+        for (const asset of page.assets) {
+          videoItems.push({
+            id: asset.id,
+            uri: asset.uri,
+            filename: asset.filename || 'Unknown',
+            duration: asset.duration || 0,
+            width: asset.width || 0,
+            height: asset.height || 0,
+            fileSize: 0,
+            modificationTime: asset.modificationTime || 0,
+            mimeType: '',
+          });
+        }
+        after = page.endCursor ?? undefined;
+        if (!page.hasNextPage) break;
+      } while (videoItems.length < MEDIA_LIBRARY_LIMIT);
 
       const deepAccessGranted = await hasAllFilesAccess();
       setAllFilesAccessGranted(deepAccessGranted);
@@ -427,18 +468,109 @@ export default function HomeScreen() {
     }
   }, []);
 
+  const loadPhotos = useCallback(async () => {
+    try {
+      setPhotosLoading(true);
+      setScanCount(0);
+      // 媒体库单次最多返回 500 条，用 after 游标分页拉全（上限 5000 张防极端）
+      const photoItems: PhotoItem[] = [];
+      let after: string | undefined;
+      const MEDIA_LIBRARY_PAGE = 500;
+      const MEDIA_LIBRARY_LIMIT = 5000;
+      do {
+        const page = await MediaLibrary.getAssetsAsync({
+          mediaType: 'photo',
+          sortBy: ['modificationTime'],
+          first: MEDIA_LIBRARY_PAGE,
+          after,
+        });
+        for (const asset of page.assets) {
+          photoItems.push({
+            id: asset.id,
+            uri: asset.uri,
+            filename: asset.filename || 'Unknown',
+            width: asset.width || 0,
+            height: asset.height || 0,
+            modificationTime: asset.modificationTime || 0,
+            fileSize: 0,
+          });
+        }
+        after = page.endCursor ?? undefined;
+        if (!page.hasNextPage) break;
+      } while (photoItems.length < MEDIA_LIBRARY_LIMIT);
+
+      const deepAccessGranted = await hasAllFilesAccess();
+      setAllFilesAccessGranted(deepAccessGranted);
+
+      if (deepAccessGranted) {
+        // onProgress 每张都回调，UI 节流到每 100 张更新一次避免频繁重渲染
+        let lastReported = 0;
+        const scanned = await scanDeviceForPhotos((count) => {
+          if (count - lastReported >= 100) {
+            lastReported = count;
+            setScanCount(count);
+          }
+        });
+        const seenPaths = new Set(photoItems.map((item) => normalizePath(item.uri)));
+
+        for (const item of scanned) {
+          const pathKey = normalizePath(item.uri);
+          if (seenPaths.has(pathKey)) continue;
+          seenPaths.add(pathKey);
+
+          photoItems.push({
+            id: `fs:${pathKey}`,
+            uri: item.uri,
+            filename: item.filename,
+            width: 0,
+            height: 0,
+            fileSize: item.size,
+            modificationTime: toMilliseconds(item.modificationTime),
+          });
+        }
+
+        photoItems.sort(
+          (a, b) => toMilliseconds(b.modificationTime) - toMilliseconds(a.modificationTime)
+        );
+      }
+
+      setPhotos(photoItems);
+    } catch (error) {
+      console.error('Failed to load photos:', error);
+    } finally {
+      setPhotosLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    AsyncStorage.getItem(PHOTO_COLUMNS_STORAGE_KEY)
+      .then((raw) => {
+        if (!mounted) return;
+        const value = Number(raw);
+        if (PHOTO_COLUMN_OPTIONS.includes(value as (typeof PHOTO_COLUMN_OPTIONS)[number])) {
+          setPhotoColumns(value);
+          photoColumnsRef.current = value;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   useEffect(() => {
     const init = async () => {
       const granted = await requestPermission();
       if (granted) {
-        await loadVideos();
+        await Promise.all([loadVideos(), loadPhotos()]);
       } else {
         setLoading(false);
       }
       setHasInitialized(true);
     };
     init();
-  }, [requestPermission, loadVideos]);
+  }, [requestPermission, loadVideos, loadPhotos]);
 
   useFocusEffect(
     useCallback(() => {
@@ -448,7 +580,7 @@ export default function HomeScreen() {
       const refreshVideos = async () => {
         const granted = await refreshPermission();
         if (isActive && granted) {
-          await loadVideos();
+          await Promise.all([loadVideos(), loadPhotos()]);
         }
       };
       refreshVideos();
@@ -456,7 +588,7 @@ export default function HomeScreen() {
       return () => {
         isActive = false;
       };
-    }, [hasInitialized, loadVideos, refreshPermission])
+    }, [hasInitialized, loadVideos, loadPhotos, refreshPermission])
   );
 
   useEffect(() => {
@@ -479,6 +611,57 @@ export default function HomeScreen() {
     },
     [router]
   );
+
+  const handleOpenPhoto = useCallback(
+    (photo: PhotoItem) => {
+      router.push('/image-upscale', {
+        uri: photo.uri,
+        title: photo.filename,
+        width: photo.width,
+        height: photo.height,
+      });
+    },
+    [router]
+  );
+
+  const applyPhotoColumns = useCallback((cols: number) => {
+    setPhotoColumns(cols);
+    photoColumnsRef.current = cols;
+    AsyncStorage.setItem(PHOTO_COLUMNS_STORAGE_KEY, String(cols)).catch(() => undefined);
+  }, []);
+
+  /** 双指捏合：放大 -> 列数变少（格子变大）；缩小 -> 列数变多（格子变小） */
+  const photoPinch = useMemo(
+    () =>
+      Gesture.Pinch()
+        .runOnJS(true)
+        .onStart(() => {
+          pinchBaseRef.current = photoColumnsRef.current;
+        })
+        .onUpdate((event) => {
+          const raw = Math.round(pinchBaseRef.current / event.scale);
+          const clamped = Math.max(PHOTO_COLUMN_MIN, Math.min(PHOTO_COLUMN_MAX, raw));
+          const nearest = PHOTO_COLUMN_OPTIONS.reduce((best, opt) =>
+            Math.abs(opt - clamped) < Math.abs(best - clamped) ? opt : best
+          );
+          if (nearest !== photoColumnsRef.current) {
+            setPhotoColumns(nearest);
+            photoColumnsRef.current = nearest;
+          }
+        })
+        .onEnd(() => {
+          AsyncStorage.setItem(PHOTO_COLUMNS_STORAGE_KEY, String(photoColumnsRef.current)).catch(
+            () => undefined
+          );
+        }),
+    []
+  );
+
+  const filteredPhotos = useMemo(() => {
+    if (!photoSearch.trim()) return photos;
+    const token = photoSearch.trim().toLowerCase();
+    return photos.filter((photo) => photo.filename.toLowerCase().includes(token));
+  }, [photos, photoSearch]);
 
   const handleRetryPermission = useCallback(async () => {
     if (!permissionCanAskAgain) {
@@ -693,6 +876,25 @@ export default function HomeScreen() {
     [handlePlayVideo, openRenameDialog, viewMode, searchTokens]
   );
 
+  const photoCardWidth = (screenWidth - GRID_GAP * 2) / photoColumns - GRID_GAP;
+
+  const renderPhotoCard = useCallback(
+    ({ item }: { item: PhotoItem }) => (
+      <TouchableOpacity
+        style={[styles.photoCard, { width: photoCardWidth }]}
+        activeOpacity={0.7}
+        onPress={() => handleOpenPhoto(item)}
+      >
+        <Image
+          source={{ uri: item.uri }}
+          style={styles.photoImage}
+          resizeMode="cover"
+        />
+      </TouchableOpacity>
+    ),
+    [handleOpenPhoto, photoCardWidth]
+  );
+
   const renderGroupedRow = useCallback(
     ({ item }: { item: VideoItem[] }) => {
       if (item.length === 1) {
@@ -747,122 +949,240 @@ export default function HomeScreen() {
         <View style={styles.headerLeft}>
           <Text style={styles.headerTitle}>视频播放器</Text>
           <Text style={styles.headerSubtitle}>
-            {isSearching
-              ? `匹配 ${filteredVideos.length} / ${videos.length} 个视频`
-              : `共 ${videos.length} 个视频`}
+            {activeTab === 'video'
+              ? isSearching
+                ? `匹配 ${filteredVideos.length} / ${videos.length} 个视频`
+                : `共 ${videos.length} 个视频`
+              : photoSearch.trim()
+                ? `匹配 ${filteredPhotos.length} / ${photos.length} 张图片`
+                : `共 ${photos.length} 张图片`}
           </Text>
         </View>
         <View style={styles.headerActions}>
-          <TouchableOpacity
-            style={styles.viewToggle}
-            onPress={() => router.push('/bili-import')}
-          >
-            <FontAwesome6 name="clapperboard" size={15} color={c.muted} />
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.viewToggle}
-            onPress={handleCycleTheme}
-          >
-            <FontAwesome6
-              name={
-                preference === 'system'
-                  ? 'circle-half-stroke'
-                  : preference === 'light'
-                    ? 'sun'
-                    : 'moon'
-              }
-              size={15}
-              color={muted}
-            />
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.viewToggle, grouped && styles.viewToggleActive]}
-            onPress={() => setGrouped((prev) => !prev)}
-          >
-            <FontAwesome6
-              name="layer-group"
-              size={17}
-              color={grouped ? c.accentForeground : c.muted}
-            />
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.viewToggle}
-            onPress={() => setViewMode(viewMode === 'grid' ? 'list' : 'grid')}
-          >
-            <FontAwesome6
-              name={viewMode === 'grid' ? 'list' : 'table-cells-large'}
-              size={18}
-              color={c.muted}
-            />
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {grouped && (
-        <View style={styles.groupTabs}>
-          {(
-            [
-              { key: 'folder', label: '按来源' },
-              { key: 'date', label: '按时间' },
-            ] as const
-          ).map((option) => {
-            const active = groupBy === option.key;
-            return (
+          {activeTab === 'video' && (
+            <>
               <TouchableOpacity
-                key={option.key}
-                style={[styles.groupTab, active && styles.groupTabActive]}
-                onPress={() => setGroupBy(option.key)}
+                style={styles.viewToggle}
+                onPress={() => router.push('/bili-import')}
               >
-                <Text
-                  style={[styles.groupTabText, active && styles.groupTabTextActive]}
-                >
-                  {option.label}
-                </Text>
+                <FontAwesome6 name="clapperboard" size={15} color={c.muted} />
               </TouchableOpacity>
-            );
-          })}
+              <TouchableOpacity
+                style={styles.viewToggle}
+                onPress={handleCycleTheme}
+              >
+                <FontAwesome6
+                  name={
+                    preference === 'system'
+                      ? 'circle-half-stroke'
+                      : preference === 'light'
+                        ? 'sun'
+                        : 'moon'
+                  }
+                  size={15}
+                  color={muted}
+                />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.viewToggle, grouped && styles.viewToggleActive]}
+                onPress={() => setGrouped((prev) => !prev)}
+              >
+                <FontAwesome6
+                  name="layer-group"
+                  size={17}
+                  color={grouped ? c.accentForeground : c.muted}
+                />
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.viewToggle}
+                onPress={() => setViewMode(viewMode === 'grid' ? 'list' : 'grid')}
+              >
+                <FontAwesome6
+                  name={viewMode === 'grid' ? 'list' : 'table-cells-large'}
+                  size={18}
+                  color={c.muted}
+                />
+              </TouchableOpacity>
+            </>
+          )}
+          {activeTab === 'photo' && (
+            <TouchableOpacity
+              style={styles.viewToggle}
+              onPress={handleCycleTheme}
+            >
+              <FontAwesome6
+                name={
+                  preference === 'system'
+                    ? 'circle-half-stroke'
+                    : preference === 'light'
+                      ? 'sun'
+                      : 'moon'
+                }
+                size={15}
+                color={muted}
+              />
+            </TouchableOpacity>
+          )}
         </View>
-      )}
-
-      <View style={styles.searchBar}>
-        <FontAwesome6 name="magnifying-glass" size={14} color={c.muted} />
-        <TextInput
-          style={styles.searchInput}
-          value={searchDraft}
-          onChangeText={setSearchDraft}
-          placeholder="搜索文件名或所在文件夹，空格分隔多个关键词"
-          placeholderTextColor={c.muted}
-          autoCorrect={false}
-          autoCapitalize="none"
-          returnKeyType="search"
-          onSubmitEditing={handleSearchSubmit}
-        />
-        {isSearching ? (
-          <TouchableOpacity
-            style={styles.searchClearButton}
-            onPress={handleSearchClear}
-            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-          >
-            <FontAwesome6 name="xmark" size={13} color={c.muted} />
-          </TouchableOpacity>
-        ) : searchDraft.trim().length > 0 ? (
-          <TouchableOpacity
-            style={styles.searchConfirmButton}
-            onPress={handleSearchSubmit}
-            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-          >
-            <FontAwesome6 name="arrow-right" size={13} color={c.accent} />
-          </TouchableOpacity>
-        ) : null}
       </View>
 
-      {isSearching && filteredVideos.length > 0 && (
-        <View style={styles.searchSummary}>
-          <FontAwesome6 name="magnifying-glass" size={11} color={c.muted} />
-          <Text style={styles.searchSummaryText}>
-            找到 {filteredVideos.length} 个相关视频
-          </Text>
+      <View style={styles.homeTabs}>
+        {(
+          [
+            { key: 'video', label: '视频', icon: 'film' },
+            { key: 'photo', label: '图片', icon: 'image' },
+          ] as const
+        ).map((tab) => {
+          const active = activeTab === tab.key;
+          return (
+            <TouchableOpacity
+              key={tab.key}
+              style={[styles.homeTab, active && styles.homeTabActive]}
+              onPress={() => setActiveTab(tab.key)}
+            >
+              <FontAwesome6
+                name={tab.icon}
+                size={14}
+                color={active ? c.accentForeground : c.muted}
+              />
+              <Text style={[styles.homeTabText, active && styles.homeTabTextActive]}>
+                {tab.label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+
+      {activeTab === 'photo' ? (
+        <View>
+          <View style={styles.searchBar}>
+            <FontAwesome6 name="magnifying-glass" size={14} color={c.muted} />
+            <TextInput
+              style={styles.searchInput}
+              value={photoSearch}
+              onChangeText={setPhotoSearch}
+              placeholder="搜索图片文件名"
+              placeholderTextColor={c.muted}
+              autoCorrect={false}
+              autoCapitalize="none"
+            />
+            {photoSearch.length > 0 && (
+              <TouchableOpacity
+                style={styles.searchClearButton}
+                onPress={() => setPhotoSearch('')}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <FontAwesome6 name="xmark" size={13} color={c.muted} />
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.gridToggle}
+              onPress={() => setGridPickerOpen((prev) => !prev)}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="切换网格大小"
+            >
+              <FontAwesome6
+                name="table-cells"
+                size={15}
+                color={gridPickerOpen ? c.accent : c.muted}
+              />
+            </TouchableOpacity>
+          </View>
+          {gridPickerOpen && (
+            <View style={styles.gridPicker}>
+              {PHOTO_COLUMN_OPTIONS.map((cols) => {
+                const selected = cols === photoColumns;
+                return (
+                  <TouchableOpacity
+                    key={cols}
+                    style={[styles.gridPickerItem, selected && styles.gridPickerItemActive]}
+                    onPress={() => applyPhotoColumns(cols)}
+                    accessibilityLabel={`${cols} 列网格`}
+                  >
+                    <Text
+                      style={[styles.gridPickerText, selected && styles.gridPickerTextActive]}
+                    >
+                      {cols}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+              <View style={styles.gridPickerHint}>
+                <FontAwesome6 name="hand" size={10} color={c.muted} />
+                <Text style={styles.gridPickerHintText}>双指捏合缩放网格</Text>
+              </View>
+            </View>
+          )}
         </View>
+      ) : (
+        <>
+          {grouped && (
+            <View style={styles.groupTabs}>
+              {(
+                [
+                  { key: 'folder', label: '按来源' },
+                  { key: 'date', label: '按时间' },
+                ] as const
+              ).map((option) => {
+                const active = groupBy === option.key;
+                return (
+                  <TouchableOpacity
+                    key={option.key}
+                    style={[styles.groupTab, active && styles.groupTabActive]}
+                    onPress={() => setGroupBy(option.key)}
+                  >
+                    <Text
+                      style={[styles.groupTabText, active && styles.groupTabTextActive]}
+                    >
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
+
+          <View style={styles.searchBar}>
+            <FontAwesome6 name="magnifying-glass" size={14} color={c.muted} />
+            <TextInput
+              style={styles.searchInput}
+              value={searchDraft}
+              onChangeText={setSearchDraft}
+              placeholder="搜索文件名或所在文件夹，空格分隔多个关键词"
+              placeholderTextColor={c.muted}
+              autoCorrect={false}
+              autoCapitalize="none"
+              returnKeyType="search"
+              onSubmitEditing={handleSearchSubmit}
+            />
+            {isSearching ? (
+              <TouchableOpacity
+                style={styles.searchClearButton}
+                onPress={handleSearchClear}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <FontAwesome6 name="xmark" size={13} color={c.muted} />
+              </TouchableOpacity>
+            ) : searchDraft.trim().length > 0 ? (
+              <TouchableOpacity
+                style={styles.searchConfirmButton}
+                onPress={handleSearchSubmit}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <FontAwesome6 name="arrow-right" size={13} color={c.accent} />
+              </TouchableOpacity>
+            ) : null}
+          </View>
+
+          {isSearching && filteredVideos.length > 0 && (
+            <View style={styles.searchSummary}>
+              <FontAwesome6 name="magnifying-glass" size={11} color={c.muted} />
+              <Text style={styles.searchSummaryText}>
+                找到 {filteredVideos.length} 个相关视频
+              </Text>
+            </View>
+          )}
+        </>
       )}
 
       {!allFilesAccessGranted && (
@@ -873,13 +1193,52 @@ export default function HomeScreen() {
         >
           <FontAwesome6 name="folder-tree" size={13} color={c.danger} />
           <Text style={styles.accessBannerText} numberOfLines={2}>
-            当前仅扫描媒体库视频，开启「所有文件访问」可扫描抖音、浏览器等全部文件夹
+            {activeTab === 'photo'
+              ? '当前仅显示媒体库图片，开启「所有文件访问」可扫描抖音、浏览器等全部图片'
+              : '当前仅扫描媒体库视频，开启「所有文件访问」可扫描抖音、浏览器等全部文件夹'}
           </Text>
           <FontAwesome6 name="chevron-right" size={12} color={c.muted} />
         </TouchableOpacity>
       )}
 
-      {videos.length === 0 ? (
+      {activeTab === 'photo' ? (
+        photosLoading ? (
+          <View style={styles.centerContainer}>
+            <ActivityIndicator size="large" color={c.accent} />
+            <Text style={styles.loadingText}>
+              {scanCount > 0 ? `正在扫描图片... 已发现 ${scanCount} 张` : '正在扫描图片...'}
+            </Text>
+          </View>
+        ) : filteredPhotos.length === 0 ? (
+          <View style={styles.emptyContainer}>
+            <FontAwesome6 name="image" size={56} color={c.muted} />
+            <Text style={styles.emptyTitle}>
+              {photos.length === 0 ? '未发现图片文件' : '未找到匹配的图片'}
+            </Text>
+            <Text style={styles.emptyDesc}>
+              {photos.length === 0
+                ? '设备媒体库中没有找到图片'
+                : '换个关键词试试'}
+            </Text>
+          </View>
+        ) : (
+          <GestureDetector gesture={photoPinch}>
+            <FlatList
+              key={`photo-grid-${photoColumns}`}
+              data={filteredPhotos}
+              keyExtractor={(item) => item.id}
+              renderItem={renderPhotoCard}
+              numColumns={photoColumns}
+              contentContainerStyle={styles.photoList}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              initialNumToRender={12}
+              maxToRenderPerBatch={16}
+              windowSize={7}
+            />
+          </GestureDetector>
+        )
+      ) : videos.length === 0 ? (
         <View style={styles.emptyContainer}>
           <FontAwesome6 name="folder-open" size={56} color={c.muted} />
           <Text style={styles.emptyTitle}>未发现视频文件</Text>
@@ -1084,6 +1443,54 @@ function createStyles(c: ThemePalette) {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+  },
+  homeTabs: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 16,
+    marginBottom: 12,
+  },
+  homeTab: {
+    flex: 1,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: c.surface,
+    borderWidth: 1,
+    borderColor: c.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  homeTabActive: {
+    backgroundColor: c.accent,
+    borderColor: c.accent,
+  },
+  homeTabText: {
+    color: c.muted,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  homeTabTextActive: {
+    color: c.accentForeground,
+  },
+  photoList: {
+    paddingHorizontal: GRID_GAP,
+    paddingBottom: 40,
+  },
+  photoCard: {
+    aspectRatio: 1,
+    marginHorizontal: GRID_GAP / 2,
+    marginBottom: GRID_GAP,
+    backgroundColor: c.backgroundTertiary,
+    borderRadius: 10,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: c.border,
+    position: 'relative',
+  },
+  photoImage: {
+    ...StyleSheet.absoluteFillObject,
   },
   groupTabs: {
     flexDirection: 'row',
@@ -1320,6 +1727,55 @@ function createStyles(c: ThemePalette) {
     height: 20,
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  gridToggle: {
+    width: 26,
+    height: 26,
+    borderRadius: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  gridPicker: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+    marginTop: -2,
+  },
+  gridPickerItem: {
+    minWidth: 34,
+    height: 30,
+    paddingHorizontal: 8,
+    borderRadius: 15,
+    backgroundColor: c.surface,
+    borderWidth: 1,
+    borderColor: c.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  gridPickerItemActive: {
+    backgroundColor: c.accent,
+    borderColor: c.accent,
+  },
+  gridPickerText: {
+    color: c.muted,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  gridPickerTextActive: {
+    color: c.accentForeground,
+  },
+  gridPickerHint: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginLeft: 'auto',
+  },
+  gridPickerHintText: {
+    color: c.muted,
+    fontSize: 10,
   },
   searchConfirmButton: {
     width: 20,

@@ -22,6 +22,27 @@ allprojects {
     google()
     mavenCentral()
     maven { url 'https://www.jitpack.io' }
+    // expo 模块 prebuilt AAR：打包在 npm 包内的 local-maven-repo（host.exp.exponent:* / BareExpo:*）
+    // 由 expo 发布，不在任何公共镜像，必须走本地文件仓库
+    def expoNodeRoot = new File(rootDir, '../node_modules')
+    def expoModuleDirs = expoNodeRoot.listFiles()
+    if (expoModuleDirs != null) {
+      def localRepos = new ArrayList<File>()
+      for (File dir : expoModuleDirs) {
+        if (!dir.isDirectory()) continue
+        if (dir.name == 'expo' || dir.name.startsWith('expo-')) {
+          File lmr = new File(dir, 'local-maven-repo')
+          if (lmr.exists()) localRepos.add(lmr)
+        }
+      }
+      // @expo 作用域下的模块（如 @expo/vector-icons 之类无 AAR，跳过；真实 AAR 模块在 expo-*）
+      for (File repo : localRepos) {
+        // 与 expo 官方 expo-autolinking-settings 一致：mavenLocal() 允许无 pom 的 artifact-only 解析
+        mavenLocal { localRepo ->
+          localRepo.url = repo.toURI().toString()
+        }
+      }
+    }
   }
 }
 

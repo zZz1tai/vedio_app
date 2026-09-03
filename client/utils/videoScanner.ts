@@ -33,6 +33,24 @@ const VIDEO_EXTENSIONS = new Set([
   '.f4v',
 ]);
 
+const PHOTO_EXTENSIONS = new Set([
+  '.jpg',
+  '.jpeg',
+  '.jpe',
+  '.jfif',
+  '.png',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.heic',
+  '.heif',
+  '.avif',
+  '.tiff',
+  '.tif',
+  '.ico',
+  '.svg',
+]);
+
 const SKIP_DIR_NAMES = new Set([
   'android',
   'lost.dir',
@@ -46,10 +64,22 @@ const SKIP_DIR_NAMES = new Set([
 
 const PRIMARY_STORAGE_ROOT = '/storage/emulated/0';
 const MAX_DEPTH = 8;
-const MAX_RESULTS = 3000;
+/**
+ * 结果上限保险值：真正限制是 TIME_BUDGET_MS 扫描预算。
+ * 手机相册上万张图很常见（微信/抖音目录动辄几千），
+ * 列表由 FlatList 虚拟化渲染，data 量 2 万条内内存与渲染均无压力。
+ */
+const MAX_RESULTS = 20000;
 const TIME_BUDGET_MS = 15000;
 
 export interface ScannedVideo {
+  uri: string;
+  filename: string;
+  size: number;
+  modificationTime: number;
+}
+
+export interface ScannedPhoto {
   uri: string;
   filename: string;
   size: number;
@@ -108,10 +138,18 @@ export function renameVideoFile(sourceUri: string, targetUri: string): boolean {
   }
 }
 
-export async function scanDeviceForVideos(
+interface ScannedFile {
+  uri: string;
+  filename: string;
+  size: number;
+  modificationTime: number;
+}
+
+async function scanByExtensions(
+  extensions: Set<string>,
   onProgress?: (count: number) => void
-): Promise<ScannedVideo[]> {
-  const results: ScannedVideo[] = [];
+): Promise<ScannedFile[]> {
+  const results: ScannedFile[] = [];
   const startedAt = Date.now();
   const queue: Array<{ dir: Directory; depth: number }> = [
     { dir: new Directory(PRIMARY_STORAGE_ROOT), depth: 0 },
@@ -146,7 +184,7 @@ export async function scanDeviceForVideos(
       if (!(entry instanceof File)) continue;
 
       const extension = entry.extension.toLowerCase();
-      if (!VIDEO_EXTENSIONS.has(extension)) continue;
+      if (!extensions.has(extension)) continue;
 
       try {
         if (!entry.exists) continue;
@@ -164,4 +202,16 @@ export async function scanDeviceForVideos(
   }
 
   return results;
+}
+
+export async function scanDeviceForVideos(
+  onProgress?: (count: number) => void
+): Promise<ScannedVideo[]> {
+  return scanByExtensions(VIDEO_EXTENSIONS, onProgress);
+}
+
+export async function scanDeviceForPhotos(
+  onProgress?: (count: number) => void
+): Promise<ScannedPhoto[]> {
+  return scanByExtensions(PHOTO_EXTENSIONS, onProgress);
 }
