@@ -1,6 +1,7 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   Image,
   Modal,
@@ -14,6 +15,7 @@ import {
 import { FontAwesome6 } from '@expo/vector-icons';
 import Toast from 'react-native-toast-message';
 import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import { useNavigation } from 'expo-router';
 import { Screen } from '@/components/Screen';
 import { useSafeRouter, useSafeSearchParams } from '@/hooks/useSafeRouter';
 import {
@@ -33,6 +35,7 @@ interface RouteParams {
 
 export default function ImageUpscaleScreen() {
   const router = useSafeRouter();
+  const navigation = useNavigation();
   const { uri, title, width, height } = useSafeSearchParams<RouteParams>();
   const [scale, setScale] = useState<2 | 4>(4);
   const [phase, setPhase] = useState<Phase>('idle');
@@ -54,6 +57,38 @@ export default function ImageUpscaleScreen() {
   }, [width, height, scale]);
 
   const running = phase === 'running';
+
+  // 页面是否仍挂载：native 推理跑在后台线程池，退出页面不会中断，产物照常落盘
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // 处理中拦截返回手势/物理返回键：产物不会丢，只是看不到结果，让用户自主选择
+  // 用 React Navigation 的 beforeRemove（expo-router 底层即 RN），native 端原生支持；
+  // expo-router 的 usePreventRemove 目前只有 web 实现，不能用于 Android
+  useEffect(() => {
+    if (!running) return;
+    const unsubscribe = navigation.addListener('beforeRemove', (event: any) => {
+      event.preventDefault();
+      Alert.alert(
+        'AI 处理中',
+        '处理会在后台继续，完成后自动保存到相册「Pictures/夜映/AI」，退出不会丢失结果。',
+        [
+          { text: '继续等待', style: 'cancel' },
+          {
+            text: '离开页面',
+            style: 'destructive',
+            onPress: () => navigation.dispatch(event.data.action),
+          },
+        ]
+      );
+    });
+    return unsubscribe;
+  }, [navigation, running]);
 
   const openViewer = useCallback(() => {
     setViewerMode(previewMode === 'result' && result ? 'result' : 'original');
@@ -78,14 +113,17 @@ export default function ImageUpscaleScreen() {
     setError(null);
     try {
       const next = await upscaleImage({ inputUri: uri, scale });
-      setResult(next);
-      setPhase('done');
+      // 即使已离开页面也提示：native 侧已完成落盘，用户需要知道结果
       Toast.show({
         type: 'success',
         text1: '超分完成',
         text2: `已保存到相册 Pictures/夜映/AI · ${next.width} × ${next.height}`,
       });
+      if (!mountedRef.current) return;
+      setResult(next);
+      setPhase('done');
     } catch (err) {
+      if (!mountedRef.current) return;
       setError(err instanceof Error ? err.message : '超分失败，请重试');
       setPhase('failed');
     }
@@ -144,7 +182,7 @@ export default function ImageUpscaleScreen() {
                 <View style={styles.previewMask}>
                   <ActivityIndicator size="large" color="#6366F1" />
                   <Text style={styles.previewMaskText}>AI 超分处理中…</Text>
-                  <Text style={styles.previewMaskHint}>4x 模式可能需要几十秒，请勿退出</Text>
+                  <Text style={styles.previewMaskHint}>需要几十秒，可退出等待，完成后自动存入相册</Text>
                 </View>
               )}
               {phase === 'done' && result && previewMode === 'original' && (
@@ -336,12 +374,15 @@ export default function ImageUpscaleScreen() {
           </View>
 
           <ZoomableImage
+            key={viewerMode}
             uri={viewerMode === 'result' && result ? result.outputUri : (uri ?? '')}
+            imageWidth={viewerMode === 'result' && result ? result.width : width}
+            imageHeight={viewerMode === 'result' && result ? result.height : height}
           />
 
           <View style={styles.viewerFooter}>
             <FontAwesome6 name="hand" size={11} color="#64748B" />
-            <Text style={styles.viewerFooterText}>双指捏合缩放 · 查看真实细节</Text>
+            <Text style={styles.viewerFooterText}>双指缩放 · 单指拖动 · 双击放大</Text>
           </View>
           </View>
         </GestureHandlerRootView>
@@ -350,33 +391,161 @@ export default function ImageUpscaleScreen() {
   );
 }
 
-/** 全屏双指缩放查看器（RN Animated + Gesture.Pinch，不依赖 reanimated） */
-function ZoomableImage({ uri }: { uri: string }) {
+/** 全屏查看器：双指缩放 + 单指拖动 + 双击放大（RN Animated + Gesture，不依赖 reanimated） */
+const MAX_ZOOM = 8;
+const DOUBLE_TAP_ZOOM = 2.5;
+
+function ZoomableImage({
+  uri,
+  imageWidth,
+  imageHeight,
+}: {
+  uri: string;
+  imageWidth?: number;
+  imageHeight?: number;
+}) {
   const zoom = useRef(new Animated.Value(1)).current;
-  const zoomRef = useRef(1);
+  const panX = useRef(new Animated.Value(0)).current;
+  const panY = useRef(new Animated.Value(0)).current;
+  // 当前值与手势基准：用 ref 保存，避免 JS 线程回调里读到过期闭包值
+  const cur = useRef({ scale: 1, x: 0, y: 0 }).current;
+  const base = useRef({ scale: 1, x: 0, y: 0 }).current;
+  const [layout, setLayout] = useState({ w: 0, h: 0 });
+
+  // 图片 contain 后的实际显示尺寸，决定拖动边界
+  const display = useMemo(() => {
+    if (!layout.w || !layout.h) return { w: 0, h: 0 };
+    if (!imageWidth || !imageHeight) return { w: layout.w, h: layout.h };
+    const fit = Math.min(layout.w / imageWidth, layout.h / imageHeight);
+    return { w: imageWidth * fit, h: imageHeight * fit };
+  }, [layout.w, layout.h, imageWidth, imageHeight]);
+
+  // 限制平移范围：只允许在放大后多出来的区域内移动，防止把图拖出屏幕
+  const clampPan = useCallback(
+    (scale: number, x: number, y: number) => {
+      const maxX = Math.max(0, (display.w * scale - layout.w) / 2);
+      const maxY = Math.max(0, (display.h * scale - layout.h) / 2);
+      return {
+        x: Math.max(-maxX, Math.min(maxX, x)),
+        y: Math.max(-maxY, Math.min(maxY, y)),
+      };
+    },
+    [display.w, display.h, layout.w, layout.h]
+  );
+
+  const apply = useCallback(
+    (scale: number, x: number, y: number) => {
+      const clamped = clampPan(scale, x, y);
+      cur.scale = scale;
+      cur.x = clamped.x;
+      cur.y = clamped.y;
+      zoom.setValue(scale);
+      panX.setValue(clamped.x);
+      panY.setValue(clamped.y);
+    },
+    [clampPan, cur, panX, panY, zoom]
+  );
+
+  // 以屏幕焦点为中心缩放：保持焦点处的图像内容视觉上不动
+  // 推导：屏幕位置 P = center + pan + C·S，保持 P 不变时 pan' = f − (f − pan)·(S'/S)
+  const zoomAt = useCallback(
+    (nextScale: number, focusX: number, focusY: number) => {
+      const s = Math.max(1, Math.min(MAX_ZOOM, nextScale));
+      const fx = focusX - layout.w / 2;
+      const fy = focusY - layout.h / 2;
+      const ratio = s / (base.scale || 1);
+      apply(s, fx - (fx - base.x) * ratio, fy - (fy - base.y) * ratio);
+    },
+    [apply, base, layout.h, layout.w]
+  );
+
+  const reset = useCallback(() => {
+    Animated.parallel([
+      Animated.spring(zoom, { toValue: 1, useNativeDriver: true, friction: 7 }),
+      Animated.spring(panX, { toValue: 0, useNativeDriver: true, friction: 7 }),
+      Animated.spring(panY, { toValue: 0, useNativeDriver: true, friction: 7 }),
+    ]).start();
+    cur.scale = 1;
+    cur.x = 0;
+    cur.y = 0;
+  }, [cur, panX, panY, zoom]);
 
   const pinch = useMemo(
     () =>
       Gesture.Pinch()
         .runOnJS(true)
         .onStart(() => {
-          zoomRef.current = Math.max(1, zoomRef.current);
+          base.scale = cur.scale;
+          base.x = cur.x;
+          base.y = cur.y;
         })
         .onUpdate((event) => {
-          const next = Math.max(1, Math.min(8, zoomRef.current * event.scale));
-          zoom.setValue(next);
+          zoomAt(base.scale * event.scale, event.focalX, event.focalY);
         })
         .onEnd(() => {
-          zoomRef.current = 1;
-          Animated.spring(zoom, { toValue: 1, useNativeDriver: true, friction: 6 }).start();
+          // 松手不再强制回弹：仅当倍率接近 1 时吸附复位，其余保持当前倍率供查看
+          if (cur.scale < 1.05) reset();
         }),
-    [zoom]
+    [base, cur, reset, zoomAt]
+  );
+
+  const pan = useMemo(
+    () =>
+      Gesture.Pan()
+        .maxPointers(1) // 单指拖动，双指时交给 Pinch
+        .runOnJS(true)
+        .onStart(() => {
+          base.x = cur.x;
+          base.y = cur.y;
+        })
+        .onUpdate((event) => {
+          if (cur.scale <= 1.01) return; // 未放大时不允许拖动
+          apply(cur.scale, base.x + event.translationX, base.y + event.translationY);
+        }),
+    [apply, base, cur]
+  );
+
+  const doubleTap = useMemo(
+    () =>
+      Gesture.Tap()
+        .numberOfTaps(2)
+        .maxDistance(24)
+        .runOnJS(true)
+        .onEnd((event) => {
+          if (cur.scale > 1.05) {
+            reset();
+            return;
+          }
+          base.scale = cur.scale;
+          base.x = cur.x;
+          base.y = cur.y;
+          zoomAt(DOUBLE_TAP_ZOOM, event.x, event.y);
+        }),
+    [base, cur, reset, zoomAt]
+  );
+
+  const gesture = useMemo(
+    () => Gesture.Simultaneous(pinch, pan, doubleTap),
+    [doubleTap, pan, pinch]
   );
 
   return (
-    <GestureDetector gesture={pinch}>
-      <Animated.View style={[styles.viewerCanvas, { transform: [{ scale: zoom }] }]}>
-        <Image source={{ uri: uri || undefined }} style={styles.viewerImage} resizeMode="contain" />
+    <GestureDetector gesture={gesture}>
+      <Animated.View
+        style={styles.viewerCanvas}
+        onLayout={(e) => {
+          const { width, height } = e.nativeEvent.layout;
+          setLayout({ w: width, h: height });
+        }}
+      >
+        <Animated.Image
+          source={{ uri: uri || undefined }}
+          style={[
+            styles.viewerImage,
+            { transform: [{ translateX: panX }, { translateY: panY }, { scale: zoom }] },
+          ]}
+          resizeMode="contain"
+        />
       </Animated.View>
     </GestureDetector>
   );
