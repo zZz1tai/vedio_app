@@ -35,12 +35,32 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
 
     override fun getName() = "StorageAccess"
 
-    // 扫描与缩略图各自单线程串行执行：IO/解码完全不占 JS 线程，也不互相阻塞
-    private val scanExecutor = Executors.newSingleThreadExecutor()
-    private val thumbExecutor = Executors.newSingleThreadExecutor()
+    // 模块销毁标记：Activity 销毁（小米墓碑等场景进程保留）/JS 重载后置位，
+    // 长任务据此静默退出——绝不回调已销毁的 bridge（回调会触发 RN C++ FATAL abort）
+    @Volatile private var destroyed = false
+
+    // 扫描与缩略图各自单线程串行执行：IO/解码完全不占 JS 线程，也不互相阻塞；
+    // daemon 线程不阻止进程退出
+    private val scanExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "StorageAccess-scan").apply { isDaemon = true }
+    }
+    private val thumbExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "StorageAccess-thumb").apply { isDaemon = true }
+    }
     private val thumbFailedUris = ConcurrentSkipListSet<String>()
     private val thumbInProgress = ConcurrentHashMap.newKeySet<String>()
     private val thumbCleanupCounter = AtomicLong(0)
+
+    /** bridge 是否仍然可用（未销毁且有活跃 RN 实例） */
+    private fun bridgeAlive(): Boolean = !destroyed && reactContext.hasActiveReactInstance()
+
+    /** RN 实例销毁（Activity finish / 进程重载）：立即置位并停掉后台线程池 */
+    override fun onCatalystInstanceDestroy() {
+        destroyed = true
+        scanExecutor.shutdownNow()
+        thumbExecutor.shutdownNow()
+        super.onCatalystInstanceDestroy()
+    }
 
     companion object {
         private const val TAG = "StorageAccess"
@@ -121,11 +141,13 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
                 val queue = ArrayDeque<Pair<File, Int>>()
                 queue.addLast(File(PRIMARY_STORAGE_ROOT) to 0)
                 while (queue.isNotEmpty()) {
+                    if (!bridgeAlive()) break
                     if (count >= maxResults) break
                     if (SystemClock.elapsedRealtime() - startedAt > budget) break
                     val (dir, depth) = queue.removeFirst()
                     val entries = dir.listFiles() ?: continue
                     for (entry in entries) {
+                        if (!bridgeAlive()) break
                         if (count >= maxResults) break
                         if (SystemClock.elapsedRealtime() - startedAt > budget) break
                         val lowerName = entry.name.lowercase()
@@ -147,14 +169,26 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
                         count++
                         if (progressEvery > 0 && count - lastProgress >= progressEvery) {
                             lastProgress = count
-                            progressCallback.invoke(count)
+                            if (!bridgeAlive()) break
+                            try {
+                                progressCallback.invoke(count)
+                            } catch (error: Throwable) {
+                                Log.w(TAG, "scan progress callback failed, aborting scan", error)
+                                break
+                            }
                         }
                     }
                 }
-                promise.resolve(results)
+                if (!bridgeAlive()) {
+                    Log.i(TAG, "scan aborted: bridge destroyed (found $count files)")
+                } else {
+                    promise.resolve(results)
+                }
             } catch (error: Throwable) {
                 Log.w(TAG, "scanMediaFiles failed", error)
-                promise.reject("SCAN_ERROR", error.message, error)
+                if (bridgeAlive()) {
+                    promise.reject("SCAN_ERROR", error.message, error)
+                }
             }
         }
     }
@@ -175,6 +209,7 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
         if (thumbFailedUris.contains(sourceUri)) return null
         if (thumbInProgress.add(sourceUri)) {
             thumbExecutor.execute {
+                if (destroyed) return@execute
                 try {
                     decodeToThumbnail(sourceUri, cacheFile, targetSize)
                     emitThumbnailReady(sourceUri)
@@ -203,6 +238,7 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
         }
         thumbExecutor.execute {
             for (uri in uris) {
+                if (destroyed) break
                 if (!thumbInProgress.add(uri)) continue
                 try {
                     val cacheFile = thumbCacheFile(uri, size) ?: continue
@@ -216,7 +252,13 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             maybeCleanupThumbCache()
-            promise.resolve(true)
+            if (!destroyed) {
+                try {
+                    promise.resolve(true)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "prepareThumbnails resolve failed (bridge gone?)", error)
+                }
+            }
         }
     }
 
@@ -295,6 +337,7 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun emitThumbnailReady(sourceUri: String) {
+        if (destroyed || !reactContext.hasActiveCatalystInstance()) return
         try {
             reactContext
                 .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
