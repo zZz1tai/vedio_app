@@ -54,6 +54,26 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
     /** bridge 是否仍然可用（未销毁且有活跃 RN 实例） */
     private fun bridgeAlive(): Boolean = !destroyed && reactContext.hasActiveReactInstance()
 
+    /**
+     * 把 JS 回调（Callback/Promise）投递到 JS 线程执行。
+     * RN 新架构（bridgeless）下从后台线程直接调用 Callback/Promise 是未定义行为，
+     * 会触发 C++ FATAL abort；必须 post 回 JS 线程。queue 已停止时安全丢弃。
+     */
+    private fun postToJsThread(runnable: () -> Unit) {
+        if (destroyed || !reactContext.hasActiveReactInstance()) return
+        try {
+            reactContext.runOnJSQueueThread {
+                try {
+                    runnable()
+                } catch (error: Throwable) {
+                    Log.w(TAG, "js-thread callback failed", error)
+                }
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "postToJsThread failed (bridge gone?)", error)
+        }
+    }
+
     /** RN 实例销毁（Activity finish / 进程重载）：立即置位并停掉后台线程池 */
     override fun onCatalystInstanceDestroy() {
         destroyed = true
@@ -170,24 +190,20 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
                         if (progressEvery > 0 && count - lastProgress >= progressEvery) {
                             lastProgress = count
                             if (!bridgeAlive()) break
-                            try {
-                                progressCallback.invoke(count)
-                            } catch (error: Throwable) {
-                                Log.w(TAG, "scan progress callback failed, aborting scan", error)
-                                break
-                            }
+                            // 回调必须投递回 JS 线程：新架构后台线程直调 Callback 会 C++ FATAL abort
+                            postToJsThread { progressCallback.invoke(count) }
                         }
                     }
                 }
                 if (!bridgeAlive()) {
                     Log.i(TAG, "scan aborted: bridge destroyed (found $count files)")
                 } else {
-                    promise.resolve(results)
+                    postToJsThread { promise.resolve(results) }
                 }
             } catch (error: Throwable) {
                 Log.w(TAG, "scanMediaFiles failed", error)
                 if (bridgeAlive()) {
-                    promise.reject("SCAN_ERROR", error.message, error)
+                    postToJsThread { promise.reject("SCAN_ERROR", error.message, error) }
                 }
             }
         }
@@ -252,12 +268,8 @@ class StorageAccessModule(private val reactContext: ReactApplicationContext) :
                 }
             }
             maybeCleanupThumbCache()
-            if (!destroyed) {
-                try {
-                    promise.resolve(true)
-                } catch (error: Throwable) {
-                    Log.w(TAG, "prepareThumbnails resolve failed (bridge gone?)", error)
-                }
+            if (bridgeAlive()) {
+                postToJsThread { promise.resolve(true) }
             }
         }
     }
